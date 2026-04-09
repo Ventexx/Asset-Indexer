@@ -631,6 +631,7 @@ class FolderSection(QWidget):
         hc_lay.setContentsMargins(indent, 0, 0, 0)
         hc_lay.setSpacing(0)
 
+        self._title = title
         self._header = QToolButton()
         self._header.setObjectName("sectionHeader")
         self._header.setCheckable(False)
@@ -644,13 +645,7 @@ class FolderSection(QWidget):
         self._header.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self._header.clicked.connect(self._toggle)
 
-        if depth > 0:
-            accent = QWidget()
-            accent.setObjectName("sectionAccent")
-            accent.setFixedWidth(2)
-            accent.setFixedHeight(22)
-            hc_lay.addWidget(accent)
-            hc_lay.addSpacing(4)
+        # (no accent stripe)
 
         hc_lay.addWidget(self._header)
         hc_lay.addStretch()  # push button to the left so only text-area gets hover bg
@@ -679,6 +674,7 @@ class FolderSection(QWidget):
         outer.addWidget(self._body)
 
         self._cards: list[ThumbnailCard] = []
+        self._current_cols: int = COLS
         self._db_ref: Optional[Database] = None
 
     def set_db(self, db: Optional[Database]) -> None:
@@ -688,26 +684,35 @@ class FolderSection(QWidget):
         card = ThumbnailCard(asset, db or self._db_ref)
         card.deleted.connect(self.card_deleted)
         card.edited.connect(self.card_edited)
+        # Add to grid immediately using a reasonable default col count;
+        # actual layout is corrected when the section is expanded/shown.
+        i = len(self._cards)
         self._cards.append(card)
-        self._relayout_cards()
+        self._card_grid.addWidget(card, i // COLS, i % COLS)
 
     def _relayout_cards(self) -> None:
-        # Remove all from grid
-        while self._card_grid.count():
-            item = self._card_grid.takeAt(0)
-            if item.widget():
-                item.widget().setParent(None)  # type: ignore[arg-type]
-
-        # Compute dynamic cols based on available width
+        """Re-flow cards into the grid based on current available width."""
         avail_w = self._card_widget.width()
-        cols = max(1, avail_w // (THUMB_W + 6)) if avail_w > THUMB_W else COLS
+        if avail_w < THUMB_W:
+            return  # not laid out yet, skip
+        cols = max(1, avail_w // (THUMB_W + 6))
+
+        # Only rebuild if column count changed
+        if cols == self._current_cols:
+            return
+        self._current_cols = cols
+
+        # takeAt removes from the layout but does NOT reparent the widget
+        while self._card_grid.count():
+            self._card_grid.takeAt(0)
 
         for i, card in enumerate(self._cards):
             self._card_grid.addWidget(card, i // cols, i % cols)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        if self._cards:
+        # Guard: only reflow when body is visible and we actually have cards
+        if self._expanded and self._cards:
             self._relayout_cards()
 
     def add_child_section(self, sec: "FolderSection") -> None:
@@ -726,6 +731,7 @@ class FolderSection(QWidget):
             Qt.ArrowType.DownArrow if self._expanded else Qt.ArrowType.RightArrow
         )
         if self._expanded and self._cards:
+            self._current_cols = 0  # force reflow on next call
             QTimer.singleShot(0, self._relayout_cards)
 
 
