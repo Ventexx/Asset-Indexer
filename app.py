@@ -6,11 +6,10 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
-    QComboBox,
     QDialog,
     QFileDialog,
     QFrame,
@@ -24,6 +23,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -33,40 +33,65 @@ APP_NAME = "Prompt Indexer"
 APP_ORG = "PromptIndexer"
 APP_DIR = Path.home() / ".prompt_indexer"
 ICON_PATH = Path(__file__).parent / "Icon.png"
-THUMB = 156
-COLS = 3
+
+# 2:3 card dimensions
+THUMB_W = 120
+THUMB_H = 180
+COLS = 6
+
+
+# ── Pixmap Cache ───────────────────────────────────────────────────────────────
+
+_PIXMAP_CACHE: dict[str, QPixmap] = {}
+
+
+def _load_pixmap(path: str) -> QPixmap:
+    if path not in _PIXMAP_CACHE:
+        pix = QPixmap(path)
+        if not pix.isNull():
+            pix = pix.scaled(
+                THUMB_W,
+                THUMB_H,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        _PIXMAP_CACHE[path] = pix
+    return _PIXMAP_CACHE[path]
 
 
 # ── Database ───────────────────────────────────────────────────────────────────
 
 
 class Database:
-    """One SQLite database per root folder."""
-
     def __init__(self, path: Path):
         self.path = path
-        self.name = path.stem  # display name == folder name
+        self.name = path.stem
         path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(path))
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute(
-            """
+        self._migrate()
+
+    def _migrate(self) -> None:
+        self._conn.execute("""
             CREATE TABLE IF NOT EXISTS assets (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                name        TEXT NOT NULL,
-                image_path  TEXT NOT NULL UNIQUE,
-                json_path   TEXT NOT NULL,
-                json_data   TEXT NOT NULL DEFAULT '{}'
+                name        TEXT    NOT NULL,
+                folder      TEXT    NOT NULL DEFAULT '',
+                image_path  TEXT    NOT NULL UNIQUE,
+                json_path   TEXT    NOT NULL,
+                json_data   TEXT    NOT NULL DEFAULT '{}'
             )
-            """
-        )
+        """)
+        cols = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(assets)").fetchall()
+        }
+        if "folder" not in cols:
+            self._conn.execute(
+                "ALTER TABLE assets ADD COLUMN folder TEXT NOT NULL DEFAULT ''"
+            )
         self._conn.commit()
 
     def index(self, folder: Path, full_rebuild: bool = False) -> tuple[int, int]:
-        """
-        Scan *folder* recursively for PNG+JSON pairs.
-        Returns (total assets, number of changes).
-        """
         if full_rebuild:
             self._conn.execute("DELETE FROM assets")
             self._conn.commit()
@@ -77,50 +102,50 @@ class Database:
         found: set[str] = set()
         changes = 0
 
-        for png in folder.rglob("*.png"):
+        for png in sorted(folder.rglob("*.png")):
             jpath = png.with_suffix(".json")
             if not jpath.exists():
                 continue
-
             try:
                 raw = jpath.read_text(encoding="utf-8", errors="ignore")
-                json.loads(raw)  # validate; raises on bad JSON
+                json.loads(raw)
             except Exception:
                 raw = "{}"
+
+            rel_folder = str(png.parent.relative_to(folder))
+            if rel_folder == ".":
+                rel_folder = ""
 
             key = str(png)
             found.add(key)
 
             if key not in existing:
                 self._conn.execute(
-                    "INSERT INTO assets(name, image_path, json_path, json_data)"
-                    " VALUES(?,?,?,?)",
-                    (png.stem, key, str(jpath), raw),
+                    "INSERT INTO assets(name, folder, image_path, json_path, json_data)"
+                    " VALUES(?,?,?,?,?)",
+                    (png.stem, rel_folder, key, str(jpath), raw),
                 )
                 changes += 1
             else:
-                # Refresh JSON data in case the file was edited
                 self._conn.execute(
-                    "UPDATE assets SET json_data=? WHERE image_path=?",
-                    (raw, key),
+                    "UPDATE assets SET json_data=?, folder=? WHERE image_path=?",
+                    (raw, rel_folder, key),
                 )
 
-        # Remove entries whose files no longer exist
         stale = existing - found
-        for path in stale:
-            self._conn.execute("DELETE FROM assets WHERE image_path=?", (path,))
+        for p in stale:
+            self._conn.execute("DELETE FROM assets WHERE image_path=?", (p,))
         changes += len(stale)
 
         self._conn.commit()
         total: int = self._conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
         return total, changes
 
-    def search(self, query: str, limit: int = 400) -> list[dict]:
+    def search(self, query: str, limit: int = 2000) -> list[dict]:
         q = f"%{query}%"
         rows = self._conn.execute(
-            "SELECT * FROM assets"
-            " WHERE name LIKE ? OR json_data LIKE ?"
-            " ORDER BY name LIMIT ?",
+            "SELECT * FROM assets WHERE name LIKE ? OR json_data LIKE ?"
+            " ORDER BY folder, name LIMIT ?",
             (q, q, limit),
         ).fetchall()
         return [dict(r) for r in rows]
@@ -137,15 +162,10 @@ class Database:
 
 
 class DatabaseManager:
-    """
-    Keeps track of all registered root folders and their Database objects.
-    The folder→path mapping is saved to roots.json in APP_DIR.
-    """
-
     def __init__(self):
         APP_DIR.mkdir(parents=True, exist_ok=True)
         self._roots_file = APP_DIR / "roots.json"
-        self._roots: dict[str, Path] = {}  # db_name → folder path
+        self._roots: dict[str, Path] = {}
         self._dbs: dict[str, Database] = {}
         self._load()
 
@@ -174,7 +194,6 @@ class DatabaseManager:
         return self._dbs[name]
 
     def add_folder(self, folder: Path) -> str:
-        """Register a new root folder and return the db name assigned to it."""
         name = folder.name
         base, n = name, 1
         while name in self._roots and self._roots[name] != folder:
@@ -203,39 +222,38 @@ class DatabaseManager:
 
 
 class ThumbnailCard(QFrame):
-    """Single image tile with a dynamic right-click context menu."""
-
-    deleted = Signal(str)  # emits image_path
+    deleted = Signal(str)
 
     def __init__(self, asset: dict, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.asset = asset
-
         self.setObjectName("card")
-        self.setFixedSize(THUMB + 8, THUMB + 8)
-        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(THUMB_W + 8, THUMB_H + 8)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(0)
 
-        lbl = QLabel()
-        lbl.setFixedSize(THUMB, THUMB)
-        lbl.setAlignment(Qt.AlignCenter)
-
-        pix = QPixmap(asset["image_path"])
-        if not pix.isNull():
-            lbl.setPixmap(
-                pix.scaled(THUMB, THUMB, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            )
-        else:
-            lbl.setText(asset["name"])
-
-        lay.addWidget(lbl)
+        self._lbl = QLabel()
+        self._lbl.setFixedSize(THUMB_W, THUMB_H)
+        self._lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl.setText("·")
+        lay.addWidget(self._lbl)
         self.setToolTip(asset["name"])
+
+        QTimer.singleShot(0, self._apply_pixmap)
+
+    def _apply_pixmap(self) -> None:
+        pix = _load_pixmap(self.asset["image_path"])
+        if not pix.isNull():
+            self._lbl.setPixmap(pix)
+            self._lbl.setText("")
+        else:
+            self._lbl.setText(self.asset["name"])
 
     def contextMenuEvent(self, event) -> None:
         menu = QMenu(self)
-
         try:
             data: dict = json.loads(self.asset.get("json_data", "{}"))
         except Exception:
@@ -246,7 +264,6 @@ class ThumbnailCard(QFrame):
             text = str(value).strip()
             if not text:
                 continue
-            # "positive_prompt" → "Copy Positive Prompt"
             label = "Copy " + " ".join(w.capitalize() for w in key.split("_"))
             act = menu.addAction(label)
             act.setData(text)
@@ -256,7 +273,6 @@ class ThumbnailCard(QFrame):
             menu.addSeparator()
 
         delete_act = menu.addAction("Delete")
-
         chosen = menu.exec(event.globalPos())
         if chosen is None:
             return
@@ -264,6 +280,67 @@ class ThumbnailCard(QFrame):
             self.deleted.emit(self.asset["image_path"])
         elif chosen.data():
             QApplication.clipboard().setText(chosen.data())
+
+
+# ── Folder Section ─────────────────────────────────────────────────────────────
+
+
+class FolderSection(QWidget):
+    card_deleted = Signal(str)
+
+    def __init__(self, title: str, depth: int = 0, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._expanded = False
+        self._depth = depth
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Header button
+        self._header = QToolButton()
+        self._header.setObjectName("sectionHeader")
+        self._header.setCheckable(True)
+        self._header.setChecked(False)
+        self._header.setArrowType(Qt.ArrowType.RightArrow)
+        self._header.setText(f"  {'  ' * depth}{title}")
+        self._header.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self._header.setFixedHeight(30)
+        self._header.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._header.clicked.connect(self._toggle)
+        outer.addWidget(self._header)
+
+        # Thin separator
+        sep = QFrame()
+        sep.setObjectName("sectionSep")
+        sep.setFrameShape(QFrame.Shape.HLine)
+        outer.addWidget(sep)
+
+        # Card grid (hidden by default)
+        self._container = QWidget()
+        self._container.setObjectName("sectionContainer")
+        indent = depth * 18
+        self._grid = QGridLayout(self._container)
+        self._grid.setContentsMargins(indent + 8, 8, 8, 12)
+        self._grid.setSpacing(6)
+        self._grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self._container.setVisible(False)
+        outer.addWidget(self._container)
+
+    def _toggle(self) -> None:
+        self._expanded = not self._expanded
+        self._container.setVisible(self._expanded)
+        self._header.setArrowType(
+            Qt.ArrowType.DownArrow if self._expanded else Qt.ArrowType.RightArrow
+        )
+
+    def add_card(self, asset: dict) -> None:
+        i = self._grid.count()
+        card = ThumbnailCard(asset)
+        card.deleted.connect(self.card_deleted)
+        self._grid.addWidget(card, i // COLS, i % COLS)
 
 
 # ── Results Panel ──────────────────────────────────────────────────────────────
@@ -274,14 +351,14 @@ class ResultsPanel(QScrollArea):
         super().__init__(parent)
         self.setObjectName("resultsPanel")
         self.setWidgetResizable(True)
-        self.setFrameShape(QFrame.NoFrame)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         self._content = QWidget()
-        self._grid = QGridLayout(self._content)
-        self._grid.setContentsMargins(6, 6, 6, 6)
-        self._grid.setSpacing(6)
-        self._grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self._layout = QVBoxLayout(self._content)
+        self._layout.setContentsMargins(6, 6, 6, 6)
+        self._layout.setSpacing(2)
+        self._layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.setWidget(self._content)
 
         self._db: Optional[Database] = None
@@ -295,15 +372,27 @@ class ResultsPanel(QScrollArea):
         self._populate(assets)
 
     def _populate(self, assets: list[dict]) -> None:
-        while self._grid.count():
-            item = self._grid.takeAt(0)
+        while self._layout.count():
+            item = self._layout.takeAt(0)
             if w := item.widget():
                 w.deleteLater()
 
-        for i, asset in enumerate(assets):
-            card = ThumbnailCard(asset)
-            card.deleted.connect(self._on_card_deleted)
-            self._grid.addWidget(card, i // COLS, i % COLS)
+        sections: dict[str, FolderSection] = {}
+        for asset in assets:
+            folder_key = asset.get("folder", "") or ""
+            if folder_key not in sections:
+                depth = folder_key.replace("\\", "/").count("/") + (
+                    1 if folder_key else 0
+                )
+                # show only the last path component as the header title
+                title = Path(folder_key).name if folder_key else "(root)"
+                sec = FolderSection(title, depth=max(0, depth - 1))
+                sec.card_deleted.connect(self._on_card_deleted)
+                sections[folder_key] = sec
+                self._layout.addWidget(sec)
+            sections[folder_key].add_card(asset)
+
+        self._layout.addStretch()
 
     def _on_card_deleted(self, image_path: str) -> None:
         if self._db:
@@ -317,12 +406,7 @@ class ResultsPanel(QScrollArea):
 
 
 class OpenDatabaseDialog(QDialog):
-    def __init__(
-        self,
-        db_manager: DatabaseManager,
-        current: str,
-        parent: Optional[QWidget] = None,
-    ):
+    def __init__(self, db_manager: DatabaseManager, current: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Open Database")
         self.setModal(True)
@@ -366,83 +450,79 @@ class MainWindow(QMainWindow):
     def __init__(self, db_manager: DatabaseManager):
         super().__init__()
         self.db_manager = db_manager
+        self._active_db = ""
         self.setWindowTitle(APP_NAME)
         self.setMinimumSize(560, 460)
-        self.resize(580, 560)
+        self.resize(1000, 720)
         if ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(ICON_PATH)))
 
-        # ── Central layout
         root = QWidget()
         self.setCentralWidget(root)
         outer = QVBoxLayout(root)
-        outer.setContentsMargins(10, 10, 10, 10)
-        outer.setSpacing(6)
+        outer.setContentsMargins(10, 8, 10, 8)
+        outer.setSpacing(4)
 
-        # ── Status bar
-        status_bar = QFrame()
-        status_bar.setObjectName("statusBar")
-        status_bar.setFixedHeight(32)
-        sb_lay = QHBoxLayout(status_bar)
-        sb_lay.setContentsMargins(4, 0, 4, 0)
-        sb_lay.setSpacing(6)
+        # ── Top row: [☰]  [search…] ─────────────────────────────────────
+        top_row = QHBoxLayout()
+        top_row.setSpacing(6)
 
         self._menu_btn = QToolButton()
         self._menu_btn.setText("☰")
         self._menu_btn.setObjectName("menuBtn")
-        self._menu_btn.setFixedSize(28, 28)
+        self._menu_btn.setFixedSize(26, 26)
         self._menu_btn.clicked.connect(self._show_app_menu)
+
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search…")
+        self._search.setFixedHeight(26)
+        self._search.textChanged.connect(self._do_search)
+
+        top_row.addWidget(self._menu_btn)
+        top_row.addWidget(self._search, 1)
+        outer.addLayout(top_row)
+
+        # ── Status bar ───────────────────────────────────────────────────
+        status_bar = QFrame()
+        status_bar.setObjectName("statusBar")
+        status_bar.setFixedHeight(22)
+        sb_lay = QHBoxLayout(status_bar)
+        sb_lay.setContentsMargins(8, 0, 8, 0)
+        sb_lay.setSpacing(8)
+
+        self._db_lbl = QLabel("—")
+        self._db_lbl.setObjectName("dbLbl")
+
+        dot = QLabel("·")
+        dot.setObjectName("statusDot")
 
         self._status_lbl = QLabel("Ready")
         self._status_lbl.setObjectName("statusLbl")
 
-        sb_lay.addWidget(self._menu_btn)
+        sb_lay.addWidget(self._db_lbl)
+        sb_lay.addWidget(dot)
         sb_lay.addWidget(self._status_lbl)
         sb_lay.addStretch()
         outer.addWidget(status_bar)
 
-        # ── Search row
-        search_row = QHBoxLayout()
-        search_row.setSpacing(6)
-
-        self._search = QLineEdit()
-        self._search.setPlaceholderText("Search…")
-        self._search.textChanged.connect(self._do_search)
-
-        self._db_combo = QComboBox()
-        self._db_combo.setFixedWidth(164)
-        self._db_combo.setPlaceholderText("— pick a database —")
-        self._db_combo.currentTextChanged.connect(self._on_db_changed)
-
-        search_row.addWidget(self._search, 1)
-        search_row.addWidget(self._db_combo)
-        outer.addLayout(search_row)
-
-        # ── Results canvas
+        # ── Results canvas ───────────────────────────────────────────────
         self._results = ResultsPanel()
         self._results.setMinimumHeight(340)
         outer.addWidget(self._results, 1)
 
-        # Populate dropdown, then run startup indexing
-        self._refresh_combo()
+        self._pick_initial_db()
         self._startup_index()
 
-    # ── Internal helpers ────────────────────────────────────────────────
+    # ── Helpers ─────────────────────────────────────────────────────────
 
-    def _refresh_combo(self, select: str = "") -> None:
-        self._db_combo.blockSignals(True)
-        self._db_combo.clear()
-        for name in self.db_manager.names():
-            self._db_combo.addItem(name)
-        if select:
-            idx = self._db_combo.findText(select)
-            self._db_combo.setCurrentIndex(max(idx, 0))
-        elif self._db_combo.count():
-            self._db_combo.setCurrentIndex(0)
-        self._db_combo.blockSignals(False)
-        self._on_db_changed(self._db_combo.currentText())
+    def _pick_initial_db(self) -> None:
+        names = self.db_manager.names()
+        if names:
+            self._set_active_db(names[0])
 
-    def _on_db_changed(self, name: str) -> None:
+    def _set_active_db(self, name: str) -> None:
+        self._active_db = name
+        self._db_lbl.setText(name or "—")
         db = self.db_manager.get(name) if name else None
         self._results.set_db(db)
         self._do_search()
@@ -453,7 +533,7 @@ class MainWindow(QMainWindow):
     def _set_status(self, msg: str) -> None:
         self._status_lbl.setText(msg)
 
-    # ── App menu actions ────────────────────────────────────────────────
+    # ── App menu ─────────────────────────────────────────────────────────
 
     def _show_app_menu(self) -> None:
         menu = QMenu(self)
@@ -477,12 +557,9 @@ class MainWindow(QMainWindow):
         self._do_search()
 
     def _action_open_db(self) -> None:
-        current = self._db_combo.currentText()
-        dlg = OpenDatabaseDialog(self.db_manager, current, self)
+        dlg = OpenDatabaseDialog(self.db_manager, self._active_db, self)
         if dlg.exec() and dlg.chosen:
-            idx = self._db_combo.findText(dlg.chosen)
-            if idx >= 0:
-                self._db_combo.setCurrentIndex(idx)
+            self._set_active_db(dlg.chosen)
 
     def _action_add_folder(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Choose a folder to add")
@@ -500,15 +577,11 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, APP_NAME, f"Indexing failed:\n{exc}")
             self._set_status("Indexing failed")
-        self._refresh_combo(select=name)
+        self._set_active_db(name)
 
-    # ── Startup ─────────────────────────────────────────────────────────
+    # ── Startup indexing ─────────────────────────────────────────────────
 
     def _startup_index(self) -> None:
-        """
-        On startup, scan all known folders for new / removed files only.
-        Does not do a full rebuild — just syncs changes since last run.
-        """
         if not self.db_manager.names():
             self._set_status("No folders yet — use ☰ → Add Folder")
             return
@@ -547,17 +620,19 @@ def apply_style(app: QApplication) -> None:
     app.setPalette(pal)
 
     app.setStyleSheet("""
-        QMainWindow, QWidget  { background: #12161e; color: #e1e4ee; font-size: 13px; }
+        QMainWindow, QWidget { background: #12161e; color: #e1e4ee; font-size: 13px; }
 
         /* status bar */
-        #statusBar  { background: rgba(255,255,255,0.03); border-radius: 8px; }
+        #statusBar  { background: rgba(255,255,255,0.03); border-radius: 5px; }
         #statusLbl  { color: rgba(255,255,255,0.42); font-size: 11px; }
+        #statusDot  { color: rgba(255,255,255,0.18); font-size: 11px; }
+        #dbLbl      { color: rgba(140,160,255,0.80); font-size: 11px; font-weight: 600; }
 
-        /* hamburger button */
+        /* hamburger */
         #menuBtn {
             background: transparent; border: none;
-            font-size: 16px; color: rgba(255,255,255,0.68);
-            border-radius: 6px;
+            font-size: 15px; color: rgba(255,255,255,0.68);
+            border-radius: 5px;
         }
         #menuBtn:hover   { background: rgba(255,255,255,0.08); }
         #menuBtn:pressed { background: rgba(255,255,255,0.04); }
@@ -566,36 +641,35 @@ def apply_style(app: QApplication) -> None:
         QLineEdit {
             background: rgba(255,255,255,0.05);
             border: 1px solid rgba(255,255,255,0.09);
-            border-radius: 10px; padding: 7px 12px;
+            border-radius: 7px; padding: 3px 10px; font-size: 12px;
             selection-background-color: #586ec8;
         }
         QLineEdit:focus { border: 1px solid rgba(140,160,255,0.40); }
 
-        /* database dropdown */
-        QComboBox {
-            background: rgba(255,255,255,0.05);
-            border: 1px solid rgba(255,255,255,0.09);
-            border-radius: 10px; padding: 7px 10px;
+        /* folder section header */
+        #sectionHeader {
+            background: rgba(255,255,255,0.035);
+            border: none; border-radius: 0px;
+            text-align: left; padding-left: 8px;
+            font-size: 12px; font-weight: 600;
+            color: rgba(200,210,255,0.75);
         }
-        QComboBox::drop-down { border: none; width: 20px; }
-        QComboBox QAbstractItemView {
-            background: #1c2133; border-radius: 8px;
-            border: 1px solid rgba(255,255,255,0.10);
-            selection-background-color: #586ec8;
-        }
+        #sectionHeader:hover  { background: rgba(255,255,255,0.07); color: #e1e4ee; }
+        #sectionSep           { color: rgba(255,255,255,0.05); max-height: 1px; }
+        #sectionContainer     { background: transparent; }
 
         /* thumbnail card */
         #card {
             background: rgba(255,255,255,0.04);
             border: 1px solid rgba(255,255,255,0.07);
-            border-radius: 10px;
+            border-radius: 8px;
         }
         #card:hover {
-            background: rgba(255,255,255,0.08);
-            border: 1px solid rgba(140,160,255,0.30);
+            background: rgba(140,160,255,0.13);
+            border: 1px solid rgba(140,160,255,0.50);
         }
 
-        /* context + app menus */
+        /* menus */
         QMenu {
             background: #1a1f30;
             border: 1px solid rgba(255,255,255,0.10);
@@ -614,7 +688,6 @@ def apply_style(app: QApplication) -> None:
         }
         QPushButton:hover   { background: rgba(255,255,255,0.11); }
         QPushButton:pressed { background: rgba(255,255,255,0.04); }
-
         QListWidget {
             background: rgba(255,255,255,0.03);
             border: 1px solid rgba(255,255,255,0.08);
@@ -624,13 +697,13 @@ def apply_style(app: QApplication) -> None:
         QListWidget::item:selected { background: rgba(88,110,200,0.55); }
 
         /* scrollbar */
-        QScrollBar:vertical { background: transparent; width: 6px; margin: 0; }
+        QScrollBar:vertical         { background: transparent; width: 5px; margin: 0; }
         QScrollBar::handle:vertical {
-            background: rgba(255,255,255,0.15); border-radius: 3px; min-height: 30px;
+            background: rgba(255,255,255,0.14); border-radius: 2px; min-height: 24px;
         }
-        QScrollBar::handle:vertical:hover  { background: rgba(255,255,255,0.28); }
+        QScrollBar::handle:vertical:hover { background: rgba(255,255,255,0.26); }
         QScrollBar::add-line:vertical,
-        QScrollBar::sub-line:vertical      { height: 0; }
+        QScrollBar::sub-line:vertical     { height: 0; }
     """)
 
 
@@ -643,13 +716,10 @@ def main() -> int:
     app.setOrganizationName(APP_ORG)
     if ICON_PATH.exists():
         app.setWindowIcon(QIcon(str(ICON_PATH)))
-
     apply_style(app)
-
     db_manager = DatabaseManager()
     win = MainWindow(db_manager)
     win.show()
-
     code = app.exec()
     db_manager.close_all()
     return code
