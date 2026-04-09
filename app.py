@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QPoint, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -328,13 +328,15 @@ class LoadingOverlay(QWidget):
 
     def resizeEvent(self, event) -> None:
         # Always fill parent
-        if self.parent():
-            self.setGeometry(self.parent().rect())
+        p = self.parent()
+        if isinstance(p, QWidget):
+            self.setGeometry(p.rect())
         super().resizeEvent(event)
 
     def showEvent(self, event) -> None:
-        if self.parent():
-            self.setGeometry(self.parent().rect())
+        p = self.parent()
+        if isinstance(p, QWidget):
+            self.setGeometry(p.rect())
         super().showEvent(event)
 
 
@@ -364,11 +366,55 @@ class IndexWorker(QThread):
 # ── Thumbnail Card ─────────────────────────────────────────────────────────────
 
 
-class EditJsonDialog(QDialog):
-    """
-    Small frameless dialog to edit the raw JSON file linked to a card's image.
-    Follows the same design as OpenDatabaseDialog.
-    """
+class _DraggableDialog(QDialog):
+    """Base for frameless dialogs that are draggable and remember position."""
+
+    _PREFS_KEY: str = ""  # subclasses set this
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._drag_pos: Optional[QPoint] = None
+
+    def _restore_pos(self) -> None:
+        key = self._PREFS_KEY
+        if not key:
+            return
+        prefs = _load_prefs()
+        pos = prefs.get(key)
+        if pos and len(pos) == 2:
+            self.move(pos[0], pos[1])
+
+    def _save_pos(self) -> None:
+        key = self._PREFS_KEY
+        if not key:
+            return
+        prefs = _load_prefs()
+        prefs[key] = [self.x(), self.y()]
+        _save_prefs(prefs)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = (
+                event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            )
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_pos and event.buttons() & Qt.MouseButton.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_pos)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._drag_pos = None
+        self._save_pos()
+        super().mouseReleaseEvent(event)
+
+
+class EditJsonDialog(_DraggableDialog):
+    """Frameless dialog to view and edit the JSON file linked to a card."""
+
+    _PREFS_KEY = "edit_json_pos"
+    W, H = 500, 460
 
     def __init__(self, asset: dict, db: Optional[Database], parent=None):
         super().__init__(parent)
@@ -376,39 +422,58 @@ class EditJsonDialog(QDialog):
         self._db = db
         self.setWindowTitle("Edit JSON")
         self.setModal(True)
-        self.setFixedSize(480, 420)
+        self.setFixedSize(self.W, self.H)
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
+        # Shadow container — transparent, just for the drop-shadow effect
+        shadow_frame = QFrame(self)
+        shadow_frame.setObjectName("dialogShadow")
+        shadow_frame.setGeometry(4, 4, self.W - 4, self.H - 4)
+
         frame = QFrame(self)
-        frame.setObjectName("dbDialogFrame")
-        frame.setGeometry(0, 0, 480, 420)
+        frame.setObjectName("editDialogFrame")
+        frame.setGeometry(0, 0, self.W - 4, self.H - 4)
 
         lay = QVBoxLayout(frame)
-        lay.setContentsMargins(1, 1, 1, 1)
+        lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
-        # Header
+        # ── Accent header bar (matches status bar style) ──────────────────
         header = QWidget()
-        header.setObjectName("dbDialogHeader")
+        header.setObjectName("editDialogHeader")
+        header.setFixedHeight(26)
         h_lay = QHBoxLayout(header)
-        h_lay.setContentsMargins(12, 10, 12, 10)
+        h_lay.setContentsMargins(14, 0, 10, 0)
+        h_lay.setSpacing(8)
+
+        dot = QWidget()
+        dot.setObjectName("editDialogDot")
+        dot.setFixedSize(6, 6)
+
         title_lbl = QLabel("Edit JSON")
-        title_lbl.setObjectName("dbDialogTitle")
+        title_lbl.setObjectName("editDialogTitle")
+
         close_btn = QToolButton()
         close_btn.setText("✕")
         close_btn.setObjectName("dbDialogClose")
         close_btn.setFixedSize(18, 18)
         close_btn.clicked.connect(self.reject)
+
+        h_lay.addWidget(dot)
         h_lay.addWidget(title_lbl)
         h_lay.addStretch()
         h_lay.addWidget(close_btn)
         lay.addWidget(header)
 
-        sep = QFrame()
-        sep.setObjectName("dbDialogSep")
-        sep.setFrameShape(QFrame.Shape.HLine)
-        lay.addWidget(sep)
+        # ── Editor area with inset border ─────────────────────────────────
+        editor_wrap = QWidget()
+        editor_wrap.setObjectName("editEditorWrap")
+        ew_lay = QVBoxLayout(editor_wrap)
+        ew_lay.setContentsMargins(10, 8, 10, 6)
+
+        self._editor = QPlainTextEdit()
+        self._editor.setObjectName("jsonEditor")
 
         # Load raw JSON from disk
         json_path = asset.get("json_path", "")
@@ -421,49 +486,51 @@ class EditJsonDialog(QDialog):
         else:
             raw = asset.get("json_data", "{}")
 
-        # Try to pretty-print
         try:
             raw = json.dumps(json.loads(raw), indent=2, ensure_ascii=False)
         except Exception:
             pass
 
-        self._editor = QPlainTextEdit()
-        self._editor.setObjectName("jsonEditor")
         self._editor.setPlainText(raw)
-        self._editor.setFont(self._editor.font())
-        lay.addWidget(self._editor, 1)
+        ew_lay.addWidget(self._editor)
+        lay.addWidget(editor_wrap, 1)
 
-        sep2 = QFrame()
-        sep2.setObjectName("dbDialogSep")
-        sep2.setFrameShape(QFrame.Shape.HLine)
-        lay.addWidget(sep2)
+        # ── Footer: cancel left, save right ──────────────────────────────
+        sep = QFrame()
+        sep.setObjectName("dbDialogSep")
+        sep.setFrameShape(QFrame.Shape.HLine)
+        lay.addWidget(sep)
 
         footer = QWidget()
-        footer.setObjectName("dbDialogFooter")
+        footer.setObjectName("editDialogFooter")
         f_lay = QHBoxLayout(footer)
-        f_lay.setContentsMargins(8, 6, 8, 8)
-        f_lay.setSpacing(6)
+        f_lay.setContentsMargins(10, 5, 10, 6)
+        f_lay.setSpacing(0)
+
         cancel_btn = QPushButton("Cancel")
-        cancel_btn.setObjectName("dbCancelBtn")
+        cancel_btn.setObjectName("editCancelBtn")
+
         save_btn = QPushButton("Save")
-        save_btn.setObjectName("dbOpenBtn")
-        f_lay.addWidget(cancel_btn)
+        save_btn.setObjectName("editSaveBtn")
+
         f_lay.addWidget(save_btn)
+        f_lay.addStretch()
+        f_lay.addWidget(cancel_btn)
         lay.addWidget(footer)
 
         cancel_btn.clicked.connect(self.reject)
         save_btn.clicked.connect(self._save)
 
+        self._restore_pos()
+
     def _save(self) -> None:
         new_text = self._editor.toPlainText().strip()
-        # Validate JSON
         try:
             json.loads(new_text)
         except json.JSONDecodeError as e:
             QMessageBox.warning(self, APP_NAME, f"Invalid JSON:\n{e}")
             return
 
-        # Write back to the .json file on disk
         json_path = self._asset.get("json_path", "")
         if json_path:
             try:
@@ -472,7 +539,6 @@ class EditJsonDialog(QDialog):
                 QMessageBox.critical(self, APP_NAME, f"Could not write file:\n{exc}")
                 return
 
-        # Update the database entry
         if self._db:
             self._db.update_json(self._asset["image_path"], new_text)
 
@@ -785,7 +851,7 @@ class ResultsPanel(QScrollArea):
     def _populate(self, assets: list[dict]) -> None:
         while self._layout.count():
             item = self._layout.takeAt(0)
-            if w := item.widget():
+            if item is not None and (w := item.widget()):
                 w.deleteLater()
 
         all_folders: list[str] = []
@@ -837,47 +903,65 @@ class ResultsPanel(QScrollArea):
             self._db.delete(image_path)
         win = self.window()
         if hasattr(win, "_do_search"):
-            win._do_search()
+            win._do_search()  # type: ignore[union-attr]
 
     def _on_card_edited(self, image_path: str) -> None:
         win = self.window()
         if hasattr(win, "_do_search"):
-            win._do_search()
+            win._do_search()  # type: ignore[union-attr]
 
 
 # ── Open Database Dialog ───────────────────────────────────────────────────────
 
 
-class OpenDatabaseDialog(QDialog):
+class OpenDatabaseDialog(_DraggableDialog):
+    _PREFS_KEY = "open_db_pos"
+    W, H = 280, 320
+
     def __init__(self, db_manager: DatabaseManager, current: str, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Open Database")
+        self.setWindowTitle("Change Database")
         self.setModal(True)
-        self.setFixedSize(260, 300)
+        self.setFixedSize(self.W, self.H)
         self.chosen: str = current
 
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
+        shadow_frame = QFrame(self)
+        shadow_frame.setObjectName("dialogShadow")
+        shadow_frame.setGeometry(4, 4, self.W - 4, self.H - 4)
+
         frame = QFrame(self)
-        frame.setObjectName("dbDialogFrame")
-        frame.setGeometry(0, 0, 260, 300)
+        frame.setObjectName("editDialogFrame")
+        frame.setGeometry(0, 0, self.W - 4, self.H - 4)
 
         lay = QVBoxLayout(frame)
-        lay.setContentsMargins(1, 1, 1, 1)
+        lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
+        # ── Accent header bar ─────────────────────────────────────────────
         header = QWidget()
-        header.setObjectName("dbDialogHeader")
+        header.setObjectName("editDialogHeader")
+        header.setFixedHeight(26)
         h_lay = QHBoxLayout(header)
-        h_lay.setContentsMargins(12, 10, 12, 10)
-        title_lbl = QLabel("Databases")
-        title_lbl.setObjectName("dbDialogTitle")
+        h_lay.setContentsMargins(14, 0, 10, 0)
+        h_lay.setSpacing(8)
+
+        dot = QWidget()
+        dot.setObjectName("editDialogDot")
+        dot.setFixedSize(6, 6)
+
+        title_lbl = QLabel("Change Database")
+        title_lbl.setObjectName("editDialogTitle")
+
         close_btn = QToolButton()
         close_btn.setText("✕")
         close_btn.setObjectName("dbDialogClose")
         close_btn.setFixedSize(18, 18)
         close_btn.clicked.connect(self.reject)
+
+        h_lay.addWidget(dot)
         h_lay.addWidget(title_lbl)
         h_lay.addStretch()
         h_lay.addWidget(close_btn)
@@ -888,6 +972,12 @@ class OpenDatabaseDialog(QDialog):
         sep.setFrameShape(QFrame.Shape.HLine)
         lay.addWidget(sep)
 
+        list_wrap = QWidget()
+        list_wrap.setObjectName("dbListWrap")
+        lw_lay = QVBoxLayout(list_wrap)
+        lw_lay.setContentsMargins(8, 6, 8, 4)
+        lw_lay.setSpacing(0)
+
         self._list = QListWidget()
         self._list.setObjectName("dbDialogList")
         self._list.setFrameShape(QFrame.Shape.NoFrame)
@@ -895,7 +985,8 @@ class OpenDatabaseDialog(QDialog):
             self._list.addItem(name)
             if name == current:
                 self._list.setCurrentRow(self._list.count() - 1)
-        lay.addWidget(self._list, 1)
+        lw_lay.addWidget(self._list)
+        lay.addWidget(list_wrap, 1)
 
         sep2 = QFrame()
         sep2.setObjectName("dbDialogSep")
@@ -903,21 +994,26 @@ class OpenDatabaseDialog(QDialog):
         lay.addWidget(sep2)
 
         footer = QWidget()
-        footer.setObjectName("dbDialogFooter")
+        footer.setObjectName("editDialogFooter")
         f_lay = QHBoxLayout(footer)
-        f_lay.setContentsMargins(8, 6, 8, 8)
-        f_lay.setSpacing(6)
+        f_lay.setContentsMargins(10, 5, 10, 6)
+        f_lay.setSpacing(0)
+
         cancel_btn = QPushButton("Cancel")
-        cancel_btn.setObjectName("dbCancelBtn")
+        cancel_btn.setObjectName("editCancelBtn")
         ok_btn = QPushButton("Open")
-        ok_btn.setObjectName("dbOpenBtn")
-        f_lay.addWidget(cancel_btn)
+        ok_btn.setObjectName("editSaveBtn")
+
         f_lay.addWidget(ok_btn)
+        f_lay.addStretch()
+        f_lay.addWidget(cancel_btn)
         lay.addWidget(footer)
 
         ok_btn.clicked.connect(self._accept)
         cancel_btn.clicked.connect(self.reject)
         self._list.itemDoubleClicked.connect(self._accept)
+
+        self._restore_pos()
 
     def _accept(self) -> None:
         item = self._list.currentItem()
@@ -1074,8 +1170,8 @@ class MainWindow(QMainWindow):
             return
 
         menu = QMenu(self)
-        menu.addAction("Reload", self._action_reload)
-        menu.addAction("Open Database", self._action_open_db)
+        menu.addAction("Reload Database", self._action_reload)
+        menu.addAction("Change Database", self._action_open_db)
         menu.addAction("Add Folder", self._action_add_folder)
         menu.aboutToHide.connect(self._on_menu_hide)
         self._app_menu = menu
@@ -1107,6 +1203,16 @@ class MainWindow(QMainWindow):
         if self._active_db:
             self.db_manager.unload(self._active_db)
         self._start_load_db(name)
+
+    # ── Keyboard shortcuts ────────────────────────────────────────────────
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Slash and not self._search.hasFocus():
+            self._search.setFocus()
+            self._search.selectAll()
+            event.accept()
+        else:
+            super().keyPressEvent(event)
 
     # ── Window close ──────────────────────────────────────────────────────
 
@@ -1264,26 +1370,51 @@ def apply_style(app: QApplication) -> None:
         QMenu::item:selected {{ background: {ACCENT_DIM}; color: {ACCENT}; }}
         QMenu::separator     {{ height: 1px; background: rgba(255,255,255,0.07); margin: 3px 4px; }}
 
-        /* ── frameless database / edit dialogs ───────────────────────── */
-        #dbDialogFrame {{
+        /* ── shadow layer behind dialog frame ───────────────────────── */
+        #dialogShadow {{
+            background: rgba(0,0,0,0.55);
+            border-radius: 10px;
+        }}
+
+        /* ── shared dialog frame ─────────────────────────────────────── */
+        #editDialogFrame {{
             background: {BG_BASE};
-            border: 1px solid rgba(255,255,255,0.09);
+            border: 1px solid rgba(255,255,255,0.13);
             border-radius: 8px;
         }}
-        #dbDialogHeader {{ background: transparent; }}
-        #dbDialogTitle {{
+
+        /* ── dialog accent header ────────────────────────────────────── */
+        #editDialogHeader {{
+            background: {BG_RAISED};
+            border-bottom: 1px solid rgba(255,255,255,0.07);
+            border-top-left-radius: 8px;
+            border-top-right-radius: 8px;
+        }}
+        #editDialogHeader QLabel, #editDialogHeader QWidget {{
+            background: transparent;
+        }}
+        #editDialogDot {{
+            background: {ACCENT};
+            border-radius: 3px;
+        }}
+        #editDialogTitle {{
             font-size: 11px; font-weight: 600;
-            color: {ACCENT}; letter-spacing: 0.3px;
+            color: {ACCENT}; letter-spacing: 0.4px;
+            background: transparent;
         }}
         #dbDialogClose {{
             background: transparent; border: none;
             color: {TEXT_DIM}; font-size: 10px; border-radius: 3px;
         }}
         #dbDialogClose:hover {{ background: rgba(255,60,60,0.18); color: rgba(255,100,100,0.9); }}
+
+        /* ── separator ───────────────────────────────────────────────── */
         #dbDialogSep {{
             background: rgba(255,255,255,0.07);
             max-height: 1px; border: none;
         }}
+
+        /* ── database list ───────────────────────────────────────────── */
         #dbDialogList {{
             background: transparent; border: none;
         }}
@@ -1292,28 +1423,44 @@ def apply_style(app: QApplication) -> None:
             font-size: 11px; color: rgba(210,215,240,0.85);
         }}
         #dbDialogList::item:selected {{ background: {ACCENT_DIM}; color: {ACCENT}; }}
-        #dbDialogList::item:hover    {{ background: rgba(255,255,255,0.05); }}
-        #dbDialogFooter {{ background: transparent; }}
-        #dbCancelBtn, #dbOpenBtn {{
+        #dbDialogList::item:hover    {{ background: rgba(255,255,255,0.025); }}
+
+        /* ── dialog footer ───────────────────────────────────────────── */
+        #editDialogFooter {{ background: transparent; }}
+
+        /* Cancel — ghost */
+        #editCancelBtn {{
             background: transparent;
             border: 1px solid rgba(255,255,255,0.08);
-            border-radius: 4px; padding: 4px 10px;
-            font-size: 11px; color: {TEXT_SEC};
+            border-radius: 4px; padding: 3px 12px;
+            font-size: 11px; color: {TEXT_DIM};
         }}
-        #dbCancelBtn:hover {{ background: rgba(255,255,255,0.05); }}
-        #dbOpenBtn {{
-            border-color: {ACCENT_MID}; color: {ACCENT};
+        #editCancelBtn:hover {{ background: rgba(255,255,255,0.04); color: {TEXT_SEC}; }}
+
+        /* Save / Open — accent */
+        #editSaveBtn {{
+            background: {ACCENT_DIM};
+            border: 1px solid {ACCENT_MID};
+            border-radius: 4px; padding: 3px 16px;
+            font-size: 11px; font-weight: 600;
+            color: {ACCENT};
         }}
-        #dbOpenBtn:hover {{ background: {ACCENT_DIM}; }}
+        #editSaveBtn:hover  {{ background: rgba(123,142,232,0.26); }}
+        #editSaveBtn:pressed {{ background: rgba(123,142,232,0.10); }}
 
         /* ── JSON editor ─────────────────────────────────────────────── */
+        #editEditorWrap, #dbListWrap {{
+            background: transparent;
+        }}
         #jsonEditor {{
             background: {BG_SURFACE};
-            border: none;
+            border: 1px solid rgba(255,255,255,0.07);
+            border-radius: 5px;
             color: {TEXT_PRI};
-            font-family: monospace;
+            font-family: "Consolas", "Courier New", monospace;
             font-size: 11px;
             selection-background-color: {ACCENT};
+            padding: 4px;
         }}
 
         /* ── loading overlay ─────────────────────────────────────────── */
