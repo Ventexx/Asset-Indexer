@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -33,12 +34,33 @@ APP_NAME = "Prompt Indexer"
 APP_ORG = "PromptIndexer"
 APP_DIR = Path.home() / ".prompt_indexer"
 ICON_PATH = Path(__file__).parent / "Icon.png"
+PREFS_FILE = APP_DIR / "prefs.json"
 
 # 2:3 card image area
 THUMB_W = 106
 THUMB_H = 159
-NAME_H = 16  # height of the name label below the image
+NAME_H = 16
 COLS = 6
+
+
+# ── Prefs ──────────────────────────────────────────────────────────────────────
+
+
+def _load_prefs() -> dict:
+    try:
+        if PREFS_FILE.exists():
+            return json.loads(PREFS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def _save_prefs(data: dict) -> None:
+    try:
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        PREFS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 
 # ── Pixmap Cache ───────────────────────────────────────────────────────────────
@@ -47,27 +69,97 @@ _PIXMAP_CACHE: dict[str, QPixmap] = {}
 
 
 def _load_pixmap(path: str) -> QPixmap:
-    """
-    Fill-crop to THUMB_W×THUMB_H (cover, no distortion).
-    The image is scaled so its shorter side matches the target,
-    then centre-cropped so it fills the frame completely.
-    """
     if path not in _PIXMAP_CACHE:
         pix = QPixmap(path)
         if not pix.isNull():
-            # Scale so the image *covers* the target rectangle
             scaled = pix.scaled(
                 THUMB_W,
                 THUMB_H,
                 Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                 Qt.TransformationMode.SmoothTransformation,
             )
-            # Centre-crop to exact size
             x = (scaled.width() - THUMB_W) // 2
             y = (scaled.height() - THUMB_H) // 2
             pix = scaled.copy(x, y, THUMB_W, THUMB_H)
         _PIXMAP_CACHE[path] = pix
     return _PIXMAP_CACHE[path]
+
+
+# ── Index logic (thread-safe, opens its own connection) ───────────────────────
+
+
+def _run_index(
+    db_path: Path,
+    folder: Path,
+    full_rebuild: bool = False,
+    progress_cb=None,  # callable(current, total, msg) or None
+) -> tuple[int, int]:
+    """
+    Opens a *fresh* SQLite connection on the calling thread, indexes `folder`,
+    and closes the connection before returning.  Safe to call from any thread.
+    Returns (total_assets, changes).
+    """
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        if full_rebuild:
+            conn.execute("DELETE FROM assets")
+            conn.commit()
+
+        existing: set[str] = {
+            r[0] for r in conn.execute("SELECT image_path FROM assets").fetchall()
+        }
+
+        candidates = [
+            png
+            for png in sorted(folder.rglob("*.png"))
+            if png.with_suffix(".json").exists()
+        ]
+        total = len(candidates)
+        found: set[str] = set()
+        changes = 0
+
+        for i, png in enumerate(candidates, 1):
+            jpath = png.with_suffix(".json")
+            try:
+                raw = jpath.read_text(encoding="utf-8", errors="ignore")
+                json.loads(raw)
+            except Exception:
+                raw = "{}"
+
+            rel_folder = str(png.parent.relative_to(folder))
+            if rel_folder == ".":
+                rel_folder = ""
+
+            key = str(png)
+            found.add(key)
+
+            if key not in existing:
+                conn.execute(
+                    "INSERT INTO assets(name, folder, image_path, json_path, json_data)"
+                    " VALUES(?,?,?,?,?)",
+                    (png.stem, rel_folder, key, str(jpath), raw),
+                )
+                changes += 1
+            else:
+                conn.execute(
+                    "UPDATE assets SET json_data=?, folder=? WHERE image_path=?",
+                    (raw, rel_folder, key),
+                )
+
+            if progress_cb:
+                progress_cb(i, total, f"Indexing ({i}/{total})")
+
+        stale = existing - found
+        for p in stale:
+            conn.execute("DELETE FROM assets WHERE image_path=?", (p,))
+        changes += len(stale)
+        conn.commit()
+
+        db_total: int = conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
+        return db_total, changes
+    finally:
+        conn.close()
 
 
 # ── Database ───────────────────────────────────────────────────────────────────
@@ -103,54 +195,8 @@ class Database:
         self._conn.commit()
 
     def index(self, folder: Path, full_rebuild: bool = False) -> tuple[int, int]:
-        if full_rebuild:
-            self._conn.execute("DELETE FROM assets")
-            self._conn.commit()
-
-        existing: set[str] = {
-            r[0] for r in self._conn.execute("SELECT image_path FROM assets").fetchall()
-        }
-        found: set[str] = set()
-        changes = 0
-
-        for png in sorted(folder.rglob("*.png")):
-            jpath = png.with_suffix(".json")
-            if not jpath.exists():
-                continue
-            try:
-                raw = jpath.read_text(encoding="utf-8", errors="ignore")
-                json.loads(raw)
-            except Exception:
-                raw = "{}"
-
-            rel_folder = str(png.parent.relative_to(folder))
-            if rel_folder == ".":
-                rel_folder = ""
-
-            key = str(png)
-            found.add(key)
-
-            if key not in existing:
-                self._conn.execute(
-                    "INSERT INTO assets(name, folder, image_path, json_path, json_data)"
-                    " VALUES(?,?,?,?,?)",
-                    (png.stem, rel_folder, key, str(jpath), raw),
-                )
-                changes += 1
-            else:
-                self._conn.execute(
-                    "UPDATE assets SET json_data=?, folder=? WHERE image_path=?",
-                    (raw, rel_folder, key),
-                )
-
-        stale = existing - found
-        for p in stale:
-            self._conn.execute("DELETE FROM assets WHERE image_path=?", (p,))
-        changes += len(stale)
-
-        self._conn.commit()
-        total: int = self._conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
-        return total, changes
+        """Blocking index on the *calling* thread's connection. Returns (total, changes)."""
+        return _run_index(self.path, folder, full_rebuild, progress_cb=None)
 
     def search(self, query: str, limit: int = 2000) -> list[dict]:
         q = f"%{query}%"
@@ -160,6 +206,13 @@ class Database:
             (q, q, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def update_json(self, image_path: str, new_json_text: str) -> None:
+        self._conn.execute(
+            "UPDATE assets SET json_data=? WHERE image_path=?",
+            (new_json_text, image_path),
+        )
+        self._conn.commit()
 
     def delete(self, image_path: str) -> None:
         self._conn.execute("DELETE FROM assets WHERE image_path=?", (image_path,))
@@ -197,12 +250,21 @@ class DatabaseManager:
     def names(self) -> list[str]:
         return sorted(self._roots.keys())
 
+    def root_for(self, name: str) -> Optional[Path]:
+        return self._roots.get(name)
+
     def get(self, name: str) -> Optional[Database]:
         if name not in self._roots:
             return None
         if name not in self._dbs:
             self._dbs[name] = Database(APP_DIR / f"{name}.db")
         return self._dbs[name]
+
+    def unload(self, name: str) -> None:
+        """Close and remove a loaded database from memory without deleting it."""
+        db = self._dbs.pop(name, None)
+        if db:
+            db.close()
 
     def add_folder(self, folder: Path) -> str:
         name = folder.name
@@ -214,33 +276,225 @@ class DatabaseManager:
         self._save()
         return name
 
-    def index_all(self, full_rebuild: bool = False) -> dict[str, tuple[int, int]]:
-        out = {}
-        for name, folder in self._roots.items():
-            if folder.exists():
-                db = self.get(name)
-                if db:
-                    out[name] = db.index(folder, full_rebuild)
-        return out
-
     def close_all(self) -> None:
         for db in self._dbs.values():
             db.close()
         self._dbs.clear()
 
 
+# ── Loading Overlay ────────────────────────────────────────────────────────────
+
+
+class LoadingOverlay(QWidget):
+    """
+    A full-panel overlay that shows a spinner animation and a progress message.
+    Parent it to the ResultsPanel (or any widget) and call show()/hide().
+    """
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        self.setObjectName("loadingOverlay")
+
+        lay = QVBoxLayout(self)
+        lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.setSpacing(12)
+
+        self._dots_lbl = QLabel("◌")
+        self._dots_lbl.setObjectName("loadingDots")
+        self._dots_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self._msg_lbl = QLabel("Loading…")
+        self._msg_lbl.setObjectName("loadingMsg")
+        self._msg_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        lay.addWidget(self._dots_lbl)
+        lay.addWidget(self._msg_lbl)
+
+        self._frame = 0
+        self._frames = ["◜", "◝", "◞", "◟"]
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(120)
+
+        self.hide()
+
+    def set_message(self, msg: str) -> None:
+        self._msg_lbl.setText(msg)
+
+    def _tick(self) -> None:
+        self._dots_lbl.setText(self._frames[self._frame % len(self._frames)])
+        self._frame += 1
+
+    def resizeEvent(self, event) -> None:
+        # Always fill parent
+        if self.parent():
+            self.setGeometry(self.parent().rect())
+        super().resizeEvent(event)
+
+    def showEvent(self, event) -> None:
+        if self.parent():
+            self.setGeometry(self.parent().rect())
+        super().showEvent(event)
+
+
+# ── Index Worker ───────────────────────────────────────────────────────────────
+
+
+class IndexWorker(QThread):
+    """Indexes a folder in a background thread using its own SQLite connection."""
+
+    progress = Signal(int, int, str)  # current, total, message
+    finished = Signal(int)  # final total
+
+    def __init__(self, db_path: Path, folder: Path, full_rebuild: bool = False):
+        super().__init__()
+        self._db_path = db_path
+        self._folder = folder
+        self._full_rebuild = full_rebuild
+
+    def run(self) -> None:
+        def _cb(current, total, msg):
+            self.progress.emit(current, total, msg)
+
+        total, _ = _run_index(self._db_path, self._folder, self._full_rebuild, _cb)
+        self.finished.emit(total)
+
+
 # ── Thumbnail Card ─────────────────────────────────────────────────────────────
+
+
+class EditJsonDialog(QDialog):
+    """
+    Small frameless dialog to edit the raw JSON file linked to a card's image.
+    Follows the same design as OpenDatabaseDialog.
+    """
+
+    def __init__(self, asset: dict, db: Optional[Database], parent=None):
+        super().__init__(parent)
+        self._asset = asset
+        self._db = db
+        self.setWindowTitle("Edit JSON")
+        self.setModal(True)
+        self.setFixedSize(480, 420)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        frame = QFrame(self)
+        frame.setObjectName("dbDialogFrame")
+        frame.setGeometry(0, 0, 480, 420)
+
+        lay = QVBoxLayout(frame)
+        lay.setContentsMargins(1, 1, 1, 1)
+        lay.setSpacing(0)
+
+        # Header
+        header = QWidget()
+        header.setObjectName("dbDialogHeader")
+        h_lay = QHBoxLayout(header)
+        h_lay.setContentsMargins(12, 10, 12, 10)
+        title_lbl = QLabel("Edit JSON")
+        title_lbl.setObjectName("dbDialogTitle")
+        close_btn = QToolButton()
+        close_btn.setText("✕")
+        close_btn.setObjectName("dbDialogClose")
+        close_btn.setFixedSize(18, 18)
+        close_btn.clicked.connect(self.reject)
+        h_lay.addWidget(title_lbl)
+        h_lay.addStretch()
+        h_lay.addWidget(close_btn)
+        lay.addWidget(header)
+
+        sep = QFrame()
+        sep.setObjectName("dbDialogSep")
+        sep.setFrameShape(QFrame.Shape.HLine)
+        lay.addWidget(sep)
+
+        # Load raw JSON from disk
+        json_path = asset.get("json_path", "")
+        raw = ""
+        if json_path and Path(json_path).exists():
+            try:
+                raw = Path(json_path).read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                raw = asset.get("json_data", "{}")
+        else:
+            raw = asset.get("json_data", "{}")
+
+        # Try to pretty-print
+        try:
+            raw = json.dumps(json.loads(raw), indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+        self._editor = QPlainTextEdit()
+        self._editor.setObjectName("jsonEditor")
+        self._editor.setPlainText(raw)
+        self._editor.setFont(self._editor.font())
+        lay.addWidget(self._editor, 1)
+
+        sep2 = QFrame()
+        sep2.setObjectName("dbDialogSep")
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        lay.addWidget(sep2)
+
+        footer = QWidget()
+        footer.setObjectName("dbDialogFooter")
+        f_lay = QHBoxLayout(footer)
+        f_lay.setContentsMargins(8, 6, 8, 8)
+        f_lay.setSpacing(6)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setObjectName("dbCancelBtn")
+        save_btn = QPushButton("Save")
+        save_btn.setObjectName("dbOpenBtn")
+        f_lay.addWidget(cancel_btn)
+        f_lay.addWidget(save_btn)
+        lay.addWidget(footer)
+
+        cancel_btn.clicked.connect(self.reject)
+        save_btn.clicked.connect(self._save)
+
+    def _save(self) -> None:
+        new_text = self._editor.toPlainText().strip()
+        # Validate JSON
+        try:
+            json.loads(new_text)
+        except json.JSONDecodeError as e:
+            QMessageBox.warning(self, APP_NAME, f"Invalid JSON:\n{e}")
+            return
+
+        # Write back to the .json file on disk
+        json_path = self._asset.get("json_path", "")
+        if json_path:
+            try:
+                Path(json_path).write_text(new_text, encoding="utf-8")
+            except Exception as exc:
+                QMessageBox.critical(self, APP_NAME, f"Could not write file:\n{exc}")
+                return
+
+        # Update the database entry
+        if self._db:
+            self._db.update_json(self._asset["image_path"], new_text)
+
+        self.accept()
 
 
 class ThumbnailCard(QWidget):
     deleted = Signal(str)
+    edited = Signal(str)  # emitted after a successful JSON edit (image_path)
 
     CARD_W = THUMB_W
-    CARD_H = THUMB_H + 4 + NAME_H  # image + gap + name label outside
+    CARD_H = THUMB_H + 4 + NAME_H
 
-    def __init__(self, asset: dict, parent: Optional[QWidget] = None):
+    def __init__(
+        self,
+        asset: dict,
+        db: Optional[Database] = None,
+        parent: Optional[QWidget] = None,
+    ):
         super().__init__(parent)
         self.asset = asset
+        self._db = db
         self.setFixedSize(self.CARD_W, self.CARD_H)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._hovered = False
@@ -249,7 +503,6 @@ class ThumbnailCard(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(4)
 
-        # Image label — clips to exact 2:3 size, rounded via paintEvent on this widget
         self._img_lbl = QLabel()
         self._img_lbl.setObjectName("cardImage")
         self._img_lbl.setFixedSize(THUMB_W, THUMB_H)
@@ -257,7 +510,6 @@ class ThumbnailCard(QWidget):
         self._img_lbl.setScaledContents(False)
         lay.addWidget(self._img_lbl)
 
-        # Name label — sits OUTSIDE and BELOW the image frame
         self._name_lbl = QLabel(asset["name"])
         self._name_lbl.setObjectName("cardName")
         self._name_lbl.setFixedHeight(NAME_H)
@@ -269,12 +521,12 @@ class ThumbnailCard(QWidget):
 
     def enterEvent(self, event) -> None:
         self._hovered = True
-        self._img_lbl.update()
+        self.update()
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
         self._hovered = False
-        self._img_lbl.update()
+        self.update()
         super().leaveEvent(event)
 
     def _apply_pixmap(self) -> None:
@@ -282,7 +534,6 @@ class ThumbnailCard(QWidget):
 
         pix = _load_pixmap(self.asset["image_path"])
         if not pix.isNull():
-            # Render pixmap with rounded corners into a new pixmap
             rounded = QPixmap(THUMB_W, THUMB_H)
             rounded.fill(Qt.GlobalColor.transparent)
             p = QPainter(rounded)
@@ -297,13 +548,20 @@ class ThumbnailCard(QWidget):
             self._img_lbl.setText("?")
 
     def paintEvent(self, event) -> None:
-        """Draw a subtle hover border around the image area only."""
         from PySide6.QtGui import QPainterPath, QPen
 
         super().paintEvent(event)
         if self._hovered:
             p = QPainter(self)
             p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+            # Highlight background behind name label
+            name_y = THUMB_H + 4
+            p.setBrush(QColor(123, 142, 232, 30))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawRoundedRect(0, name_y, self.CARD_W, NAME_H, 3, 3)
+
+            # Border around image
             pen = QPen(QColor(140, 160, 255, 140))
             pen.setWidth(2)
             p.setPen(pen)
@@ -333,12 +591,15 @@ class ThumbnailCard(QWidget):
         if data:
             menu.addSeparator()
 
-        delete_act = menu.addAction("Delete")
+        edit_act = menu.addAction("Edit JSON…")
         chosen = menu.exec(event.globalPos())
         if chosen is None:
             return
-        if chosen is delete_act:
-            self.deleted.emit(self.asset["image_path"])
+        if chosen is edit_act:
+            dlg = EditJsonDialog(self.asset, self._db, self)
+            if dlg.exec():
+                # Refresh asset json_data from db so copies are updated
+                self.edited.emit(self.asset["image_path"])
         elif chosen.data():
             QApplication.clipboard().setText(chosen.data())
 
@@ -347,13 +608,8 @@ class ThumbnailCard(QWidget):
 
 
 class FolderSection(QWidget):
-    """
-    A collapsible section that can hold either cards or child FolderSections.
-    depth=0 → top-level folder (e.g. Pokemon)
-    depth=1 → sub-folder (e.g. Pokemon/Kanto)
-    """
-
     card_deleted = Signal(str)
+    card_edited = Signal(str)
 
     def __init__(self, title: str, depth: int = 0, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -366,8 +622,8 @@ class FolderSection(QWidget):
         outer.setSpacing(0)
 
         # ── Header ──────────────────────────────────────────────────────
-        # Wrap with indent padding so the hover background only covers the
-        # visible text+arrow area, not the entire width including indent space.
+        # We use a fixed-width container so the header button itself only takes
+        # up as much space as its text + icon need (instead of stretching full width).
         header_container = QWidget()
         header_container.setObjectName("sectionHeaderWrap")
         hc_lay = QHBoxLayout(header_container)
@@ -380,14 +636,14 @@ class FolderSection(QWidget):
         self._header.setCheckable(False)
         self._header.setArrowType(Qt.ArrowType.RightArrow)
         self._header.setText(title)
+        # SizePolicy: preferred width (shrinks to content), fixed height
         self._header.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed
         )
         self._header.setFixedHeight(24 if depth == 0 else 22)
         self._header.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self._header.clicked.connect(self._toggle)
 
-        # Visual line accent for sub-folders
         if depth > 0:
             accent = QWidget()
             accent.setObjectName("sectionAccent")
@@ -397,17 +653,20 @@ class FolderSection(QWidget):
             hc_lay.addSpacing(4)
 
         hc_lay.addWidget(self._header)
+        hc_lay.addStretch()  # push button to the left so only text-area gets hover bg
         outer.addWidget(header_container)
 
-        # ── Body (cards + child sections) ───────────────────────────────
+        # ── Body ─────────────────────────────────────────────────────────
         self._body = QWidget()
         self._body.setObjectName("sectionBody")
         self._body_lay = QVBoxLayout(self._body)
         self._body_lay.setContentsMargins(indent + 8, 4, 4, 6)
         self._body_lay.setSpacing(2)
 
-        # Card grid lives inside body
         self._card_widget = QWidget()
+        self._card_widget.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
         self._card_grid = QGridLayout(self._card_widget)
         self._card_grid.setContentsMargins(0, 0, 0, 0)
         self._card_grid.setSpacing(6)
@@ -419,23 +678,46 @@ class FolderSection(QWidget):
         self._body.setVisible(False)
         outer.addWidget(self._body)
 
-    # ── Public API ───────────────────────────────────────────────────────
+        self._cards: list[ThumbnailCard] = []
+        self._db_ref: Optional[Database] = None
 
-    def add_card(self, asset: dict) -> None:
-        i = self._card_grid.count()
-        card = ThumbnailCard(asset)
+    def set_db(self, db: Optional[Database]) -> None:
+        self._db_ref = db
+
+    def add_card(self, asset: dict, db: Optional[Database] = None) -> None:
+        card = ThumbnailCard(asset, db or self._db_ref)
         card.deleted.connect(self.card_deleted)
-        self._card_grid.addWidget(card, i // COLS, i % COLS)
+        card.edited.connect(self.card_edited)
+        self._cards.append(card)
+        self._relayout_cards()
+
+    def _relayout_cards(self) -> None:
+        # Remove all from grid
+        while self._card_grid.count():
+            item = self._card_grid.takeAt(0)
+            if item.widget():
+                item.widget().setParent(None)  # type: ignore[arg-type]
+
+        # Compute dynamic cols based on available width
+        avail_w = self._card_widget.width()
+        cols = max(1, avail_w // (THUMB_W + 6)) if avail_w > THUMB_W else COLS
+
+        for i, card in enumerate(self._cards):
+            self._card_grid.addWidget(card, i // cols, i % cols)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._cards:
+            self._relayout_cards()
 
     def add_child_section(self, sec: "FolderSection") -> None:
         self._child_sections.append(sec)
         sec.card_deleted.connect(self.card_deleted)
+        sec.card_edited.connect(self.card_edited)
         self._body_lay.addWidget(sec)
 
     def has_cards(self) -> bool:
-        return self._card_grid.count() > 0
-
-    # ── Toggle ───────────────────────────────────────────────────────────
+        return len(self._cards) > 0
 
     def _toggle(self) -> None:
         self._expanded = not self._expanded
@@ -443,6 +725,8 @@ class FolderSection(QWidget):
         self._header.setArrowType(
             Qt.ArrowType.DownArrow if self._expanded else Qt.ArrowType.RightArrow
         )
+        if self._expanded and self._cards:
+            QTimer.singleShot(0, self._relayout_cards)
 
 
 # ── Results Panel ──────────────────────────────────────────────────────────────
@@ -465,6 +749,9 @@ class ResultsPanel(QScrollArea):
 
         self._db: Optional[Database] = None
 
+        # Loading overlay (child of the viewport so it covers the scroll area)
+        self._overlay = LoadingOverlay(self.viewport())
+
     def set_db(self, db: Optional[Database]) -> None:
         self._db = db
         self.refresh()
@@ -473,19 +760,28 @@ class ResultsPanel(QScrollArea):
         assets = self._db.search(query) if self._db else []
         self._populate(assets)
 
+    def show_loading(self, msg: str = "Loading…") -> None:
+        self._overlay.set_message(msg)
+        self._overlay.show()
+        self._overlay.raise_()
+
+    def update_loading(self, msg: str) -> None:
+        self._overlay.set_message(msg)
+
+    def hide_loading(self) -> None:
+        self._overlay.hide()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        # Keep overlay in sync
+        self._overlay.setGeometry(self.viewport().rect())
+
     def _populate(self, assets: list[dict]) -> None:
-        # Clear
         while self._layout.count():
             item = self._layout.takeAt(0)
             if w := item.widget():
                 w.deleteLater()
 
-        # Build a tree of sections from the flat ordered asset list.
-        # folder values are like "Pokemon", "Pokemon/Kanto", "Pokemon/Johto"
-        # We need to create parent sections for intermediate folders even if
-        # they contain no direct assets.
-
-        # Step 1: collect all unique folder paths (normalised to forward-slash)
         all_folders: list[str] = []
         seen: set[str] = set()
         for asset in assets:
@@ -493,50 +789,51 @@ class ResultsPanel(QScrollArea):
             if fk not in seen:
                 seen.add(fk)
                 all_folders.append(fk)
-            # Also ensure all ancestor folders exist
             parts = fk.split("/")
             for depth in range(1, len(parts)):
                 ancestor = "/".join(parts[:depth])
                 if ancestor not in seen:
                     seen.add(ancestor)
-                    # Insert ancestor before fk
                     idx = all_folders.index(fk)
                     all_folders.insert(idx, ancestor)
 
-        # Sort so parents always precede children
         all_folders.sort()
 
-        # Step 2: create FolderSection for every folder
         sections: dict[str, FolderSection] = {}
         for fk in all_folders:
             parts = fk.split("/") if fk else []
             depth = len(parts)
             title = parts[-1] if parts else "(root)"
             sec = FolderSection(title, depth=depth)
+            sec.set_db(self._db)
             sec.card_deleted.connect(self._on_card_deleted)
+            sec.card_edited.connect(self._on_card_edited)
             sections[fk] = sec
 
             if depth <= 1:
-                # Top-level → add directly to scroll content
                 self._layout.addWidget(sec)
             else:
                 parent_key = "/".join(parts[:-1])
                 if parent_key in sections:
                     sections[parent_key].add_child_section(sec)
                 else:
-                    self._layout.addWidget(sec)  # fallback
+                    self._layout.addWidget(sec)
 
-        # Step 3: distribute assets into their sections
         for asset in assets:
             fk = (asset.get("folder", "") or "").replace("\\", "/")
             if fk in sections:
-                sections[fk].add_card(asset)
+                sections[fk].add_card(asset, self._db)
 
         self._layout.addStretch()
 
     def _on_card_deleted(self, image_path: str) -> None:
         if self._db:
             self._db.delete(image_path)
+        win = self.window()
+        if hasattr(win, "_do_search"):
+            win._do_search()
+
+    def _on_card_edited(self, image_path: str) -> None:
         win = self.window()
         if hasattr(win, "_do_search"):
             win._do_search()
@@ -553,11 +850,9 @@ class OpenDatabaseDialog(QDialog):
         self.setFixedSize(260, 300)
         self.chosen: str = current
 
-        # Remove title bar chrome for a cleaner popup feel
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
-        # Outer frame with rounded corners
         frame = QFrame(self)
         frame.setObjectName("dbDialogFrame")
         frame.setGeometry(0, 0, 260, 300)
@@ -566,7 +861,6 @@ class OpenDatabaseDialog(QDialog):
         lay.setContentsMargins(1, 1, 1, 1)
         lay.setSpacing(0)
 
-        # Header row
         header = QWidget()
         header.setObjectName("dbDialogHeader")
         h_lay = QHBoxLayout(header)
@@ -583,13 +877,11 @@ class OpenDatabaseDialog(QDialog):
         h_lay.addWidget(close_btn)
         lay.addWidget(header)
 
-        # Separator
         sep = QFrame()
         sep.setObjectName("dbDialogSep")
         sep.setFrameShape(QFrame.Shape.HLine)
         lay.addWidget(sep)
 
-        # List
         self._list = QListWidget()
         self._list.setObjectName("dbDialogList")
         self._list.setFrameShape(QFrame.Shape.NoFrame)
@@ -599,7 +891,6 @@ class OpenDatabaseDialog(QDialog):
                 self._list.setCurrentRow(self._list.count() - 1)
         lay.addWidget(self._list, 1)
 
-        # Footer buttons
         sep2 = QFrame()
         sep2.setObjectName("dbDialogSep")
         sep2.setFrameShape(QFrame.Shape.HLine)
@@ -637,7 +928,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.db_manager = db_manager
         self._active_db = ""
-        self._app_menu: Optional[QMenu] = None  # track open menu for toggle
+        self._app_menu: Optional[QMenu] = None
+        self._index_worker: Optional[IndexWorker] = None
+
         self.setWindowTitle(APP_NAME)
         self.setMinimumSize(560, 460)
         self.resize(1000, 720)
@@ -650,12 +943,12 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(10, 8, 10, 8)
         outer.setSpacing(4)
 
-        # ── Top row: [☰]  [search…] ──────────────────────────────────────
+        # ── Top row ───────────────────────────────────────────────────────
         top_row = QHBoxLayout()
         top_row.setSpacing(6)
 
         self._menu_btn = QToolButton()
-        self._menu_btn.setText("☰")
+        self._menu_btn.setText("≡")
         self._menu_btn.setObjectName("menuBtn")
         self._menu_btn.setFixedSize(26, 26)
         self._menu_btn.clicked.connect(self._toggle_app_menu)
@@ -669,9 +962,7 @@ class MainWindow(QMainWindow):
         top_row.addWidget(self._search, 1)
         outer.addLayout(top_row)
 
-        # ── Status bar ───────────────────────────────────────────────────
-        # Use a plain QWidget (not QFrame) — avoids the background-gap issue
-        # with QFrame's internal margin/border.
+        # ── Status bar ────────────────────────────────────────────────────
         status_bar = QWidget()
         status_bar.setObjectName("statusBar")
         status_bar.setFixedHeight(22)
@@ -694,27 +985,73 @@ class MainWindow(QMainWindow):
         sb_lay.addStretch()
         outer.addWidget(status_bar)
 
-        # ── Results canvas ───────────────────────────────────────────────
+        # ── Results canvas ────────────────────────────────────────────────
         self._results = ResultsPanel()
         self._results.setMinimumHeight(340)
         outer.addWidget(self._results, 1)
 
         self._pick_initial_db()
-        self._startup_index()
 
-    # ── Helpers ──────────────────────────────────────────────────────────
+    # ── Helpers ───────────────────────────────────────────────────────────
 
     def _pick_initial_db(self) -> None:
+        prefs = _load_prefs()
+        last = prefs.get("last_db", "")
         names = self.db_manager.names()
-        if names:
-            self._set_active_db(names[0])
+        if not names:
+            self._set_status("No folders yet — use ≡ → Add Folder")
+            return
+        target = last if last in names else names[0]
+        self._start_load_db(target)
 
     def _set_active_db(self, name: str) -> None:
         self._active_db = name
         self._db_lbl.setText(name or "—")
+        prefs = _load_prefs()
+        prefs["last_db"] = name
+        _save_prefs(prefs)
         db = self.db_manager.get(name) if name else None
         self._results.set_db(db)
         self._do_search()
+
+    def _start_load_db(self, name: str) -> None:
+        """Begin background indexing for a database, showing the loading overlay."""
+        if self._index_worker and self._index_worker.isRunning():
+            return  # already busy
+
+        self._active_db = name
+        self._db_lbl.setText(name or "—")
+        self._set_status("Starting…")
+        self._results.show_loading("Starting…")
+        self._search.setEnabled(False)
+        self._menu_btn.setEnabled(False)
+
+        db = self.db_manager.get(name)
+        folder = self.db_manager.root_for(name)
+        if db is None or folder is None or not folder.exists():
+            self._results.hide_loading()
+            self._search.setEnabled(True)
+            self._menu_btn.setEnabled(True)
+            self._set_active_db(name)
+            return
+
+        worker = IndexWorker(db.path, folder, full_rebuild=False)
+        worker.progress.connect(self._on_index_progress)
+        worker.finished.connect(lambda total: self._on_index_finished(name, total))
+        self._index_worker = worker
+        worker.start()
+
+    def _on_index_progress(self, current: int, total: int, msg: str) -> None:
+        self._results.update_loading(msg)
+        self._set_status(msg)
+
+    def _on_index_finished(self, name: str, total: int) -> None:
+        self._results.hide_loading()
+        self._search.setEnabled(True)
+        self._menu_btn.setEnabled(True)
+        self._set_active_db(name)
+        self._set_status(f"{total} assets")
+        self._index_worker = None
 
     def _do_search(self) -> None:
         self._results.refresh(self._search.text().strip())
@@ -722,10 +1059,9 @@ class MainWindow(QMainWindow):
     def _set_status(self, msg: str) -> None:
         self._status_lbl.setText(msg)
 
-    # ── App menu (toggle) ─────────────────────────────────────────────────
+    # ── App menu ──────────────────────────────────────────────────────────
 
     def _toggle_app_menu(self) -> None:
-        # If a menu is already open, close it
         if self._app_menu is not None:
             self._app_menu.close()
             self._app_menu = None
@@ -743,23 +1079,18 @@ class MainWindow(QMainWindow):
         self._app_menu = None
 
     def _action_reload(self) -> None:
-        self._set_status("Rebuilding databases…")
-        QApplication.processEvents()
-        try:
-            results = self.db_manager.index_all(full_rebuild=True)
-            total = sum(t for t, _ in results.values())
-            self._set_status(
-                f"Reloaded — {total} assets across {len(results)} database(s)"
-            )
-        except Exception as exc:
-            QMessageBox.critical(self, APP_NAME, f"Reload failed:\n{exc}")
-            self._set_status("Reload failed")
-        self._do_search()
+        if self._active_db:
+            self._start_load_db(self._active_db)
 
     def _action_open_db(self) -> None:
         dlg = OpenDatabaseDialog(self.db_manager, self._active_db, self)
         if dlg.exec() and dlg.chosen:
-            self._set_active_db(dlg.chosen)
+            name = dlg.chosen
+            if name != self._active_db:
+                # Unload the current db from memory if it isn't the same
+                if self._active_db:
+                    self.db_manager.unload(self._active_db)
+                self._start_load_db(name)
 
     def _action_add_folder(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Choose a folder to add")
@@ -767,36 +1098,22 @@ class MainWindow(QMainWindow):
             return
         folder = Path(path)
         name = self.db_manager.add_folder(folder)
-        self._set_status(f'Indexing "{name}"…')
-        QApplication.processEvents()
-        try:
-            db = self.db_manager.get(name)
-            if db:
-                total, new = db.index(folder)
-                self._set_status(f'"{name}" — {total} assets ({new} new)')
-        except Exception as exc:
-            QMessageBox.critical(self, APP_NAME, f"Indexing failed:\n{exc}")
-            self._set_status("Indexing failed")
-        self._set_active_db(name)
+        if self._active_db:
+            self.db_manager.unload(self._active_db)
+        self._start_load_db(name)
 
-    # ── Startup indexing ──────────────────────────────────────────────────
+    # ── Window close ──────────────────────────────────────────────────────
 
-    def _startup_index(self) -> None:
-        if not self.db_manager.names():
-            self._set_status("No folders yet — use ☰ → Add Folder")
-            return
-        self._set_status("Checking for changes…")
-        QApplication.processEvents()
-        try:
-            results = self.db_manager.index_all(full_rebuild=False)
-            total = sum(t for t, _ in results.values())
-            changed = sum(c for _, c in results.values())
-            self._set_status(
-                f"{total} assets" + (f"  ·  {changed} updated" if changed else "")
-            )
-        except Exception as exc:
-            self._set_status(f"Startup index error: {exc}")
-        self._do_search()
+    def closeEvent(self, event) -> None:
+        # Stop any running worker
+        if self._index_worker and self._index_worker.isRunning():
+            self._index_worker.quit()
+            self._index_worker.wait(2000)
+        # Close all open database connections
+        self.db_manager.close_all()
+        # Clear pixmap cache to release file handles
+        _PIXMAP_CACHE.clear()
+        super().closeEvent(event)
 
 
 # ── Styling ────────────────────────────────────────────────────────────────────
@@ -805,12 +1122,11 @@ class MainWindow(QMainWindow):
 def apply_style(app: QApplication) -> None:
     app.setStyle("Fusion")
 
-    # Deep navy-to-charcoal base with indigo accent
-    BG_BASE = "#0d1017"  # near-black, slight blue
-    BG_SURFACE = "#131720"  # card/panel surface
-    BG_RAISED = "#181e2e"  # slightly raised elements
+    BG_BASE = "#0d1017"
+    BG_SURFACE = "#131720"
+    BG_RAISED = "#181e2e"
     BG_BORDER = "rgba(255,255,255,0.07)"
-    ACCENT = "#7b8ee8"  # muted periwinkle
+    ACCENT = "#7b8ee8"
     ACCENT_DIM = "rgba(123,142,232,0.18)"
     ACCENT_MID = "rgba(123,142,232,0.38)"
     TEXT_PRI = "#dde1f0"
@@ -844,6 +1160,10 @@ def apply_style(app: QApplication) -> None:
             border: 1px solid {BG_BORDER};
             border-radius: 5px;
         }}
+        /* Labels inside the status bar must share its background */
+        #statusBar QLabel {{
+            background: transparent;
+        }}
         #statusLbl {{ color: {TEXT_SEC}; font-size: 11px; }}
         #statusDot {{ color: {TEXT_DIM}; font-size: 11px; }}
         #dbLbl     {{ color: {ACCENT}; font-size: 11px; font-weight: 600; letter-spacing: 0.3px; }}
@@ -851,7 +1171,7 @@ def apply_style(app: QApplication) -> None:
         /* ── hamburger ───────────────────────────────────────────────── */
         #menuBtn {{
             background: transparent; border: none;
-            font-size: 14px; color: rgba(255,255,255,0.55);
+            font-size: 18px; color: rgba(255,255,255,0.55);
             border-radius: 5px;
         }}
         #menuBtn:hover   {{ background: {ACCENT_DIM}; color: {ACCENT}; }}
@@ -893,7 +1213,7 @@ def apply_style(app: QApplication) -> None:
             border-radius: 1px;
         }}
 
-        /* ── thumbnail card — NO QSS border/bg, all custom-painted ─── */
+        /* ── thumbnail card ─────────────────────────────────────────── */
         #cardImage {{
             background: {BG_SURFACE};
             border-radius: 7px;
@@ -904,7 +1224,7 @@ def apply_style(app: QApplication) -> None:
             background: transparent;
         }}
 
-        /* ── card context menu — compact & square ────────────────────── */
+        /* ── card context menu ───────────────────────────────────────── */
         QMenu#cardMenu {{
             background: {BG_BASE};
             border: 1px solid rgba(255,255,255,0.09);
@@ -927,7 +1247,7 @@ def apply_style(app: QApplication) -> None:
             margin: 3px 4px;
         }}
 
-        /* ── app / open-db menus — match card menu style ─────────────── */
+        /* ── app menus ───────────────────────────────────────────────── */
         QMenu {{
             background: {BG_BASE};
             border: 1px solid rgba(255,255,255,0.09);
@@ -938,68 +1258,72 @@ def apply_style(app: QApplication) -> None:
         QMenu::item:selected {{ background: {ACCENT_DIM}; color: {ACCENT}; }}
         QMenu::separator     {{ height: 1px; background: rgba(255,255,255,0.07); margin: 3px 4px; }}
 
-        /* ── frameless database dialog ───────────────────────────────── */
+        /* ── frameless database / edit dialogs ───────────────────────── */
         #dbDialogFrame {{
             background: {BG_BASE};
             border: 1px solid rgba(255,255,255,0.09);
             border-radius: 8px;
         }}
-        #dbDialogHeader {{
-            background: transparent;
-        }}
+        #dbDialogHeader {{ background: transparent; }}
         #dbDialogTitle {{
-            font-size: 11px;
-            font-weight: 600;
-            color: {ACCENT};
-            letter-spacing: 0.3px;
+            font-size: 11px; font-weight: 600;
+            color: {ACCENT}; letter-spacing: 0.3px;
         }}
         #dbDialogClose {{
-            background: transparent;
-            border: none;
-            color: {TEXT_DIM};
-            font-size: 10px;
-            border-radius: 3px;
+            background: transparent; border: none;
+            color: {TEXT_DIM}; font-size: 10px; border-radius: 3px;
         }}
         #dbDialogClose:hover {{ background: rgba(255,60,60,0.18); color: rgba(255,100,100,0.9); }}
         #dbDialogSep {{
             background: rgba(255,255,255,0.07);
-            max-height: 1px;
-            border: none;
+            max-height: 1px; border: none;
         }}
         #dbDialogList {{
-            background: transparent;
-            border: none;
+            background: transparent; border: none;
         }}
         #dbDialogList::item {{
-            padding: 5px 12px;
-            border-radius: 3px;
-            font-size: 11px;
-            color: rgba(210,215,240,0.85);
+            padding: 5px 12px; border-radius: 3px;
+            font-size: 11px; color: rgba(210,215,240,0.85);
         }}
-        #dbDialogList::item:selected {{
-            background: {ACCENT_DIM};
-            color: {ACCENT};
-        }}
-        #dbDialogList::item:hover {{
-            background: rgba(255,255,255,0.05);
-        }}
+        #dbDialogList::item:selected {{ background: {ACCENT_DIM}; color: {ACCENT}; }}
+        #dbDialogList::item:hover    {{ background: rgba(255,255,255,0.05); }}
         #dbDialogFooter {{ background: transparent; }}
         #dbCancelBtn, #dbOpenBtn {{
             background: transparent;
             border: 1px solid rgba(255,255,255,0.08);
-            border-radius: 4px;
-            padding: 4px 10px;
-            font-size: 11px;
-            color: {TEXT_SEC};
+            border-radius: 4px; padding: 4px 10px;
+            font-size: 11px; color: {TEXT_SEC};
         }}
         #dbCancelBtn:hover {{ background: rgba(255,255,255,0.05); }}
         #dbOpenBtn {{
-            border-color: {ACCENT_MID};
-            color: {ACCENT};
+            border-color: {ACCENT_MID}; color: {ACCENT};
         }}
         #dbOpenBtn:hover {{ background: {ACCENT_DIM}; }}
 
-        /* ── generic dialog fallback ─────────────────────────────────── */
+        /* ── JSON editor ─────────────────────────────────────────────── */
+        #jsonEditor {{
+            background: {BG_SURFACE};
+            border: none;
+            color: {TEXT_PRI};
+            font-family: monospace;
+            font-size: 11px;
+            selection-background-color: {ACCENT};
+        }}
+
+        /* ── loading overlay ─────────────────────────────────────────── */
+        #loadingOverlay {{
+            background: rgba(13,16,23,0.88);
+        }}
+        #loadingDots {{
+            font-size: 28px;
+            color: {ACCENT};
+        }}
+        #loadingMsg {{
+            font-size: 12px;
+            color: {TEXT_SEC};
+        }}
+
+        /* ── generic fallback ────────────────────────────────────────── */
         QDialog {{ background: {BG_SURFACE}; }}
         QPushButton {{
             background: rgba(255,255,255,0.05);
@@ -1043,7 +1367,6 @@ def main() -> int:
     win = MainWindow(db_manager)
     win.show()
     code = app.exec()
-    db_manager.close_all()
     return code
 
 
