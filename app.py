@@ -104,7 +104,17 @@ def _run_index(
     try:
         if full_rebuild:
             conn.execute("DELETE FROM assets")
+            conn.execute("DELETE FROM folder_meta")
             conn.commit()
+
+        # Ensure folder_meta exists (for DBs created before this feature)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS folder_meta (
+                folder_key  TEXT    PRIMARY KEY,
+                copy_value  TEXT    NOT NULL DEFAULT ''
+            )
+        """)
+        conn.commit()
 
         existing: set[str] = {
             r[0] for r in conn.execute("SELECT image_path FROM assets").fetchall()
@@ -154,6 +164,72 @@ def _run_index(
         for p in stale:
             conn.execute("DELETE FROM assets WHERE image_path=?", (p,))
         changes += len(stale)
+
+        # ── Scan for !F-[FolderName].json files and upsert into folder_meta ──
+        # Walk every directory under `folder` (including root) and look for a
+        # file matching !F-<dirname>.json (case-insensitive on the stem).
+        seen_folder_keys: set[str] = set()
+        for dir_path in sorted(folder.rglob("*")):
+            if not dir_path.is_dir():
+                continue
+            expected_stem = f"!F-{dir_path.name}"
+            meta_file = dir_path / f"{expected_stem}.json"
+            if not meta_file.exists():
+                # Try case-insensitive match on Windows-style paths
+                matches = [
+                    f
+                    for f in dir_path.iterdir()
+                    if f.suffix.lower() == ".json"
+                    and f.stem.lower() == expected_stem.lower()
+                ]
+                meta_file = matches[0] if matches else None
+            if meta_file and meta_file.exists():
+                try:
+                    raw = meta_file.read_text(encoding="utf-8", errors="ignore")
+                    data = json.loads(raw)
+                    # Take the first (and for now only) value
+                    copy_value = str(next(iter(data.values()))) if data else ""
+                except Exception:
+                    copy_value = ""
+                rel = str(dir_path.relative_to(folder)).replace("\\", "/")
+                if rel == ".":
+                    rel = ""
+                seen_folder_keys.add(rel)
+                conn.execute(
+                    "INSERT INTO folder_meta(folder_key, copy_value)"
+                    " VALUES(?,?) ON CONFLICT(folder_key) DO UPDATE SET copy_value=excluded.copy_value",
+                    (rel, copy_value),
+                )
+        # Also check the root folder itself for a matching !F-<rootname>.json
+        root_stem = f"!F-{folder.name}"
+        root_meta = folder / f"{root_stem}.json"
+        if not root_meta.exists():
+            matches = [
+                f
+                for f in folder.iterdir()
+                if f.suffix.lower() == ".json" and f.stem.lower() == root_stem.lower()
+            ]
+            root_meta = matches[0] if matches else None
+        if root_meta and root_meta.exists():
+            try:
+                raw = root_meta.read_text(encoding="utf-8", errors="ignore")
+                data = json.loads(raw)
+                copy_value = str(next(iter(data.values()))) if data else ""
+            except Exception:
+                copy_value = ""
+            seen_folder_keys.add("")
+            conn.execute(
+                "INSERT INTO folder_meta(folder_key, copy_value)"
+                " VALUES(?,?) ON CONFLICT(folder_key) DO UPDATE SET copy_value=excluded.copy_value",
+                ("", copy_value),
+            )
+        # Remove stale folder_meta rows for folders that no longer have an F-*.json
+        existing_fk = {
+            r[0] for r in conn.execute("SELECT folder_key FROM folder_meta").fetchall()
+        }
+        for stale_fk in existing_fk - seen_folder_keys:
+            conn.execute("DELETE FROM folder_meta WHERE folder_key=?", (stale_fk,))
+
         conn.commit()
 
         db_total: int = conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
@@ -192,6 +268,13 @@ class Database:
             self._conn.execute(
                 "ALTER TABLE assets ADD COLUMN folder TEXT NOT NULL DEFAULT ''"
             )
+        # Folder-level metadata table (stores F-[Name].json value per folder path)
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS folder_meta (
+                folder_key  TEXT    PRIMARY KEY,
+                copy_value  TEXT    NOT NULL DEFAULT ''
+            )
+        """)
         self._conn.commit()
 
     def index(self, folder: Path, full_rebuild: bool = False) -> tuple[int, int]:
@@ -201,11 +284,17 @@ class Database:
     def search(self, query: str, limit: int = 2000) -> list[dict]:
         q = f"%{query}%"
         rows = self._conn.execute(
-            "SELECT * FROM assets WHERE name LIKE ? OR json_data LIKE ?"
-            " ORDER BY folder, name LIMIT ?",
-            (q, q, limit),
+            "SELECT * FROM assets WHERE name LIKE ? ORDER BY folder, name LIMIT ?",
+            (q, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def get_folder_meta(self, folder_key: str) -> Optional[str]:
+        """Return the copy_value for a folder if an F-[Name].json was indexed, else None."""
+        row = self._conn.execute(
+            "SELECT copy_value FROM folder_meta WHERE folder_key=?", (folder_key,)
+        ).fetchone()
+        return row[0] if row else None
 
     def update_json(self, image_path: str, new_json_text: str) -> None:
         self._conn.execute(
@@ -716,25 +805,30 @@ class FolderSection(QWidget):
     card_deleted = Signal(str)
     card_edited = Signal(str)
 
-    def __init__(self, title: str, depth: int = 0, parent: Optional[QWidget] = None):
+    def __init__(
+        self,
+        title: str,
+        depth: int = 0,
+        copy_value: str = "",
+        parent: Optional[QWidget] = None,
+    ):
         super().__init__(parent)
         self._expanded = False
         self._depth = depth
         self._child_sections: list[FolderSection] = []
+        self._copy_value = copy_value
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
         # ── Header ──────────────────────────────────────────────────────
-        # We use a fixed-width container so the header button itself only takes
-        # up as much space as its text + icon need (instead of stretching full width).
         header_container = QWidget()
         header_container.setObjectName("sectionHeaderWrap")
         hc_lay = QHBoxLayout(header_container)
         indent = depth * 14
         hc_lay.setContentsMargins(indent, 0, 0, 0)
-        hc_lay.setSpacing(0)
+        hc_lay.setSpacing(4)
 
         self._title = title
         self._header = QToolButton()
@@ -742,7 +836,6 @@ class FolderSection(QWidget):
         self._header.setCheckable(False)
         self._header.setArrowType(Qt.ArrowType.RightArrow)
         self._header.setText(title)
-        # SizePolicy: preferred width (shrinks to content), fixed height
         self._header.setSizePolicy(
             QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed
         )
@@ -750,10 +843,22 @@ class FolderSection(QWidget):
         self._header.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self._header.clicked.connect(self._toggle)
 
-        # (no accent stripe)
-
         hc_lay.addWidget(self._header)
-        hc_lay.addStretch()  # push button to the left so only text-area gets hover bg
+
+        # Copy button — only created when this folder has an !F-*.json
+        self._copy_btn: Optional[QToolButton] = None
+        if copy_value:
+            btn = QToolButton()
+            btn.setText("Copy")
+            btn.setObjectName("folderCopyBtn")
+            btn.setToolTip("Copy Folder Tag")
+            btn.setVisible(False)  # shown only when expanded
+            btn.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+            btn.clicked.connect(self._copy_meta_value)
+            hc_lay.addWidget(btn)
+            self._copy_btn = btn
+
+        hc_lay.addStretch()
         outer.addWidget(header_container)
 
         # ── Body ─────────────────────────────────────────────────────────
@@ -829,12 +934,18 @@ class FolderSection(QWidget):
     def has_cards(self) -> bool:
         return len(self._cards) > 0
 
+    def _copy_meta_value(self) -> None:
+        if self._copy_value:
+            QApplication.clipboard().setText(self._copy_value)
+
     def _toggle(self) -> None:
         self._expanded = not self._expanded
         self._body.setVisible(self._expanded)
         self._header.setArrowType(
             Qt.ArrowType.DownArrow if self._expanded else Qt.ArrowType.RightArrow
         )
+        if self._copy_btn is not None:
+            self._copy_btn.setVisible(self._expanded)
         if self._expanded and self._cards:
             self._current_cols = 0  # force reflow on next call
             QTimer.singleShot(0, self._relayout_cards)
@@ -921,7 +1032,8 @@ class ResultsPanel(QScrollArea):
             parts = fk.split("/") if fk else []
             depth = len(parts)
             title = parts[-1] if parts else "(root)"
-            sec = FolderSection(title, depth=depth)
+            copy_value = self._db.get_folder_meta(fk) if self._db else None
+            sec = FolderSection(title, depth=depth, copy_value=copy_value or "")
             sec.set_db(self._db)
             sec.card_deleted.connect(self._on_card_deleted)
             sec.card_edited.connect(self._on_card_edited)
@@ -1101,9 +1213,15 @@ class MainWindow(QMainWindow):
         self._menu_btn.clicked.connect(self._toggle_app_menu)
 
         self._search = QLineEdit()
-        self._search.setPlaceholderText("Search…")
+        self._search.setPlaceholderText("Press / to search…")
         self._search.setFixedHeight(26)
-        self._search.textChanged.connect(self._do_search)
+        self._search.textChanged.connect(self._on_search_text_changed)
+
+        # Debounce timer: fires _do_search 1 s after the user stops typing
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(1000)
+        self._search_timer.timeout.connect(self._do_search)
 
         top_row.addWidget(self._menu_btn)
         top_row.addWidget(self._search, 1)
@@ -1201,7 +1319,11 @@ class MainWindow(QMainWindow):
         self._set_status(f"{total} assets")
         self._index_worker = None
 
+    def _on_search_text_changed(self) -> None:
+        self._search_timer.start()  # restart the 1-second debounce window
+
     def _do_search(self) -> None:
+        self._search_timer.stop()
         self._results.refresh(self._search.text().strip())
 
     def _set_status(self, msg: str) -> None:
@@ -1255,7 +1377,7 @@ class MainWindow(QMainWindow):
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key.Key_Slash and not self._search.hasFocus():
             self._search.setFocus()
-            self._search.selectAll()
+            self._search.clear()
             event.accept()
         else:
             super().keyPressEvent(event)
@@ -1363,6 +1485,26 @@ def apply_style(app: QApplication) -> None:
         #sectionHeader:hover {{
             background: {ACCENT_DIM};
             color: {ACCENT};
+        }}
+
+        /* ── folder copy button (!F-*.json) ─────────────────────────── */
+        #folderCopyBtn {{
+            background: transparent;
+            border: 1px solid rgba(123,142,232,0.20);
+            border-radius: 3px;
+            color: rgba(123,142,232,0.45);
+            font-size: 9px;
+            font-weight: 500;
+            letter-spacing: 0.2px;
+            padding: 1px 5px;
+        }}
+        #folderCopyBtn:hover {{
+            background: {ACCENT_DIM};
+            border-color: {ACCENT_MID};
+            color: {ACCENT};
+        }}
+        #folderCopyBtn:pressed {{
+            background: rgba(123,142,232,0.08);
         }}
 
         /* accent stripe on sub-folder headers */
