@@ -954,6 +954,114 @@ class EditJsonDialog(_DraggableDialog):
         self.accept()
 
 
+class AddTagDialog(_DraggableDialog):
+    """Frameless dialog for adding a tag to a folder or an entry."""
+
+    _PREFS_KEY = "add_tag_pos"
+    W, H = 360, 148
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.tag_text: str = ""
+        self.setWindowTitle("Add Tag")
+        self.setModal(True)
+        self.setFixedSize(self.W, self.H)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        shadow_frame = QFrame(self)
+        shadow_frame.setObjectName("dialogShadow")
+        shadow_frame.setGeometry(4, 4, self.W - 4, self.H - 4)
+
+        frame = QFrame(self)
+        frame.setObjectName("editDialogFrame")
+        frame.setGeometry(0, 0, self.W - 4, self.H - 4)
+
+        lay = QVBoxLayout(frame)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        # ── Header ────────────────────────────────────────────────────────
+        header = QWidget()
+        header.setObjectName("editDialogHeader")
+        header.setFixedHeight(26)
+        h_lay = QHBoxLayout(header)
+        h_lay.setContentsMargins(14, 0, 10, 0)
+        h_lay.setSpacing(8)
+
+        dot = QWidget()
+        dot.setObjectName("editDialogDot")
+        dot.setFixedSize(6, 6)
+
+        title_lbl = QLabel("Add Tag")
+        title_lbl.setObjectName("editDialogTitle")
+
+        close_btn = QToolButton()
+        close_btn.setText("✕")
+        close_btn.setObjectName("dbDialogClose")
+        close_btn.setFixedSize(18, 18)
+        close_btn.clicked.connect(self.reject)
+
+        h_lay.addWidget(dot)
+        h_lay.addWidget(title_lbl)
+        h_lay.addStretch()
+        h_lay.addWidget(close_btn)
+        lay.addWidget(header)
+
+        sep = QFrame()
+        sep.setObjectName("dbDialogSep")
+        sep.setFrameShape(QFrame.Shape.HLine)
+        lay.addWidget(sep)
+
+        # ── Body: single text field ───────────────────────────────────────
+        body = QWidget()
+        b_lay = QVBoxLayout(body)
+        b_lay.setContentsMargins(14, 10, 14, 8)
+        b_lay.setSpacing(0)
+
+        self._tag_edit = QLineEdit()
+        self._tag_edit.setObjectName("scriptArgsEdit")
+        self._tag_edit.setPlaceholderText("Enter tag...")
+        self._tag_edit.setFixedHeight(24)
+        self._tag_edit.returnPressed.connect(self._accept)
+        b_lay.addWidget(self._tag_edit)
+        b_lay.addStretch()
+        lay.addWidget(body, 1)
+
+        sep2 = QFrame()
+        sep2.setObjectName("dbDialogSep")
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        lay.addWidget(sep2)
+
+        # ── Footer: Save (left), Cancel (right) ───────────────────────────
+        footer = QWidget()
+        footer.setObjectName("editDialogFooter")
+        f_lay = QHBoxLayout(footer)
+        f_lay.setContentsMargins(10, 5, 10, 6)
+        f_lay.setSpacing(0)
+
+        save_btn = QPushButton("Save")
+        save_btn.setObjectName("editSaveBtn")
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setObjectName("editCancelBtn")
+
+        f_lay.addWidget(save_btn)
+        f_lay.addStretch()
+        f_lay.addWidget(cancel_btn)
+        lay.addWidget(footer)
+
+        save_btn.clicked.connect(self._accept)
+        cancel_btn.clicked.connect(self.reject)
+
+        self._restore_pos()
+        QTimer.singleShot(0, self._tag_edit.setFocus)
+
+    def _accept(self) -> None:
+        self.tag_text = self._tag_edit.text().strip()
+        self.accept()
+
+
 class ThumbnailCard(QWidget):
     deleted = Signal(str)
     edited = Signal(str)  # emitted after a successful JSON edit (image_path)
@@ -1105,6 +1213,8 @@ class ThumbnailCard(QWidget):
         if data:
             menu.addSeparator()
 
+        add_tag_act = menu.addAction("Add Tag")
+        menu.addSeparator()
         edit_act = menu.addAction("Edit JSON...")
         chosen = menu.exec(event.globalPos())
         if chosen is None:
@@ -1114,8 +1224,61 @@ class ThumbnailCard(QWidget):
             if dlg.exec():
                 # Refresh asset json_data from db so copies are updated
                 self.edited.emit(self.asset["image_path"])
+        elif chosen is add_tag_act:
+            self._add_tag()
         elif chosen.data():
             QApplication.clipboard().setText(chosen.data())
+
+    def _add_tag(self) -> None:
+        dlg = AddTagDialog(self)
+        if not dlg.exec():
+            return
+        tag = dlg.tag_text
+        if not tag:
+            return
+
+        if DEV_MODE:
+            # In dev mode just update in-memory json_data
+            try:
+                data = json.loads(self.asset.get("json_data", "{}"))
+            except Exception:
+                data = {}
+            existing = data.get("tags", "")
+            data["tags"] = f"{existing}, {tag}" if existing else tag
+            new_text = json.dumps(data, indent=2, ensure_ascii=False)
+            self.asset["json_data"] = new_text
+            if self._db:
+                self._db.update_json(self.asset["image_path"], new_text)
+            self.edited.emit(self.asset["image_path"])
+            return
+
+        json_path = self.asset.get("json_path", "")
+        if not json_path:
+            return
+        try:
+            raw = (
+                Path(json_path).read_text(encoding="utf-8", errors="ignore")
+                if Path(json_path).exists()
+                else "{}"
+            )
+            data = json.loads(raw)
+        except Exception:
+            data = {}
+
+        existing = data.get("tags", "")
+        data["tags"] = f"{existing}, {tag}" if existing else tag
+        new_text = json.dumps(data, indent=2, ensure_ascii=False)
+
+        try:
+            Path(json_path).write_text(new_text, encoding="utf-8")
+        except Exception as exc:
+            QMessageBox.critical(self, APP_NAME, f"Could not write file:\n{exc}")
+            return
+
+        if self._db:
+            self._db.update_json(self.asset["image_path"], new_text)
+        self.asset["json_data"] = new_text
+        self.edited.emit(self.asset["image_path"])
 
 
 # ── Folder Section ─────────────────────────────────────────────────────────────
@@ -1124,12 +1287,15 @@ class ThumbnailCard(QWidget):
 class FolderSection(QWidget):
     card_deleted = Signal(str)
     card_edited = Signal(str)
+    folder_tagged = Signal(str)  # emitted when a folder tag is written (folder_key)
 
     def __init__(
         self,
         title: str,
         depth: int = 0,
         copy_value: str = "",
+        folder_key: str = "",
+        root_folder: Optional[Path] = None,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
@@ -1137,6 +1303,8 @@ class FolderSection(QWidget):
         self._depth = depth
         self._child_sections: list[FolderSection] = []
         self._copy_value = copy_value
+        self._folder_key = folder_key
+        self._root_folder = root_folder
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -1162,6 +1330,10 @@ class FolderSection(QWidget):
         self._header.setFixedHeight(24 if depth == 0 else 22)
         self._header.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self._header.clicked.connect(self._toggle)
+        self._header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._header.customContextMenuRequested.connect(
+            lambda pos: self._on_header_context_menu(self._header.mapToGlobal(pos))
+        )
 
         hc_lay.addWidget(self._header)
 
@@ -1250,6 +1422,7 @@ class FolderSection(QWidget):
         self._child_sections.append(sec)
         sec.card_deleted.connect(self.card_deleted)
         sec.card_edited.connect(self.card_edited)
+        sec.folder_tagged.connect(self.folder_tagged)
         self._body_lay.addWidget(sec)
 
     def has_cards(self) -> bool:
@@ -1271,6 +1444,149 @@ class FolderSection(QWidget):
             self._current_cols = 0  # force reflow on next call
             QTimer.singleShot(0, self._relayout_cards)
 
+    def _on_header_context_menu(self, global_pos) -> None:
+        # Context menu only available when folder is expanded
+        if not self._expanded:
+            return
+
+        menu = QMenu(self)
+        menu.setObjectName("cardMenu")
+
+        add_tag_act = menu.addAction("Add Tag")
+        menu.addSeparator()
+        edit_json_act = menu.addAction("Edit JSON...")
+
+        chosen = menu.exec(global_pos)
+        if chosen is None:
+            return
+        if chosen is add_tag_act:
+            self._add_folder_tag()
+        elif chosen is edit_json_act:
+            self._edit_folder_json()
+
+    def _get_folder_dir(self) -> Optional[Path]:
+        """Return the actual filesystem directory for this folder section."""
+        if self._root_folder is None:
+            return None
+        if self._folder_key:
+            return self._root_folder / self._folder_key
+        return self._root_folder
+
+    def _add_folder_tag(self) -> None:
+        dlg = AddTagDialog(self)
+        if not dlg.exec():
+            return
+        tag = dlg.tag_text
+        if not tag:
+            return
+
+        if DEV_MODE:
+            self.folder_tagged.emit(self._folder_key)
+            return
+
+        folder_dir = self._get_folder_dir()
+        if folder_dir is None or not folder_dir.exists():
+            QMessageBox.warning(self, APP_NAME, "Could not locate folder on disk.")
+            return
+
+        # The meta file for a folder named "Foo" is: Foo/!F-Foo.json
+        folder_name = folder_dir.name
+        meta_filename = f"!F-{folder_name}.json"
+        meta_path = folder_dir / meta_filename
+
+        try:
+            if meta_path.exists():
+                raw = meta_path.read_text(encoding="utf-8", errors="ignore")
+                data = json.loads(raw)
+            else:
+                data = {}
+        except Exception:
+            data = {}
+
+        existing = data.get("tags", "")
+        data["tags"] = f"{existing}, {tag}" if existing else tag
+
+        try:
+            meta_path.write_text(
+                json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, APP_NAME, f"Could not write file:\n{exc}")
+            return
+
+        # Re-index the folder meta and update copy_value so Copy button appears
+        if self._db_ref and self._root_folder:
+            try:
+                conn = sqlite3.connect(str(self._db_ref.path))
+                conn.row_factory = sqlite3.Row
+                copy_val = str(next(iter(data.values()))) if data else ""
+                conn.execute(
+                    "INSERT INTO folder_meta(folder_key, copy_value)"
+                    " VALUES(?,?) ON CONFLICT(folder_key) DO UPDATE SET copy_value=excluded.copy_value",
+                    (self._folder_key, copy_val),
+                )
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+
+        self.folder_tagged.emit(self._folder_key)
+
+    def _edit_folder_json(self) -> None:
+        """Open Edit JSON for the folder's !F-*.json meta file."""
+        if DEV_MODE:
+            return
+
+        folder_dir = self._get_folder_dir()
+        if folder_dir is None or not folder_dir.exists():
+            QMessageBox.warning(self, APP_NAME, "Could not locate folder on disk.")
+            return
+
+        folder_name = folder_dir.name
+        meta_filename = f"!F-{folder_name}.json"
+        meta_path = folder_dir / meta_filename
+
+        try:
+            if meta_path.exists():
+                raw = meta_path.read_text(encoding="utf-8", errors="ignore")
+            else:
+                raw = "{}"
+            raw = json.dumps(json.loads(raw), indent=2, ensure_ascii=False)
+        except Exception:
+            raw = "{}"
+
+        # Build a fake asset dict so EditJsonDialog can work
+        fake_asset = {
+            "image_path": "",
+            "json_path": str(meta_path),
+            "json_data": raw,
+            "name": meta_filename,
+        }
+        dlg = EditJsonDialog(fake_asset, None, self)
+        if dlg.exec():
+            # Re-index folder meta in DB
+            if self._db_ref:
+                try:
+                    new_raw = (
+                        meta_path.read_text(encoding="utf-8", errors="ignore")
+                        if meta_path.exists()
+                        else "{}"
+                    )
+                    data = json.loads(new_raw)
+                    copy_val = str(next(iter(data.values()))) if data else ""
+                    conn = sqlite3.connect(str(self._db_ref.path))
+                    conn.row_factory = sqlite3.Row
+                    conn.execute(
+                        "INSERT INTO folder_meta(folder_key, copy_value)"
+                        " VALUES(?,?) ON CONFLICT(folder_key) DO UPDATE SET copy_value=excluded.copy_value",
+                        (self._folder_key, copy_val),
+                    )
+                    conn.commit()
+                    conn.close()
+                except Exception:
+                    pass
+            self.folder_tagged.emit(self._folder_key)
+
 
 # ── Results Panel ──────────────────────────────────────────────────────────────
 
@@ -1291,12 +1607,16 @@ class ResultsPanel(QScrollArea):
         self.setWidget(self._content)
 
         self._db: Optional[Database] = None
+        self._root_folder: Optional[Path] = None
 
         # Loading overlay (child of the viewport so it covers the scroll area)
         self._overlay = LoadingOverlay(self.viewport())
 
-    def set_db(self, db: Optional[Database]) -> None:
+    def set_db(
+        self, db: Optional[Database], root_folder: Optional[Path] = None
+    ) -> None:
         self._db = db
+        self._root_folder = root_folder
         self.refresh()
 
     def refresh(self, query: str = "") -> None:
@@ -1354,10 +1674,17 @@ class ResultsPanel(QScrollArea):
             depth = len(parts)
             title = parts[-1] if parts else "(root)"
             copy_value = self._db.get_folder_meta(fk) if self._db else None
-            sec = FolderSection(title, depth=depth, copy_value=copy_value or "")
+            sec = FolderSection(
+                title,
+                depth=depth,
+                copy_value=copy_value or "",
+                folder_key=fk,
+                root_folder=self._root_folder,
+            )
             sec.set_db(self._db)
             sec.card_deleted.connect(self._on_card_deleted)
             sec.card_edited.connect(self._on_card_edited)
+            sec.folder_tagged.connect(self._on_folder_tagged)
             sections[fk] = sec
 
             if depth <= 1:
@@ -1384,6 +1711,12 @@ class ResultsPanel(QScrollArea):
             win._do_search()  # type: ignore[union-attr]
 
     def _on_card_edited(self, image_path: str) -> None:
+        win = self.window()
+        if hasattr(win, "_do_search"):
+            win._do_search()  # type: ignore[union-attr]
+
+    def _on_folder_tagged(self, folder_key: str) -> None:
+        # Reload the whole view so the Copy button appears after a new tag
         win = self.window()
         if hasattr(win, "_do_search"):
             win._do_search()  # type: ignore[union-attr]
@@ -2172,7 +2505,8 @@ class MainWindow(QMainWindow):
             prefs["last_db"] = name
             _save_prefs(prefs)
         db = self.db_manager.get(name) if name else None
-        self._results.set_db(db)
+        root_folder = self.db_manager.root_for(name) if name else None
+        self._results.set_db(db, root_folder)
         self._do_search()
 
     def _start_load_db(self, name: str) -> None:
