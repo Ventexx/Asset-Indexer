@@ -47,8 +47,8 @@ It features native support for Windows and Linux, with partial Wayland support.
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/prompt-indexer.git
-   cd prompt-indexer
+   git clone https://github.com/yourusername/asset-indexer.git
+   cd asset-indexer
    ```
 
 2. Start the app using the provided script (recommended):
@@ -96,9 +96,9 @@ To fully remove the application:
 
 2. Remove application data stored on your system:
    - **Linux / macOS**:  
-     ~/.prompt_indexer/
+     ~/.asset_indexer/
    - **Windows**:  
-     C:\Users\<YourUser>\.prompt_indexer\
+     C:\Users\<YourUser>\.asset_indexer\
 
 This directory contains:
 - Indexed databases (`.db` files)  
