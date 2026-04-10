@@ -44,3 +44,4 @@ htmlcov/
 *.bak
 *.tmp
 scripts/
+logs/
