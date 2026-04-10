@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QPoint, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QIcon, QPainter, QPalette, QPixmap
+from PySide6.QtCore import QMimeData, QPoint, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QDrag, QIcon, QPainter, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -564,6 +564,7 @@ class ThumbnailCard(QWidget):
         self.setFixedSize(self.CARD_W, self.CARD_H)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._hovered = False
+        self._drag_start_pos: Optional[QPoint] = None
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -584,6 +585,44 @@ class ThumbnailCard(QWidget):
         lay.addWidget(self._name_lbl)
 
         QTimer.singleShot(0, self._apply_pixmap)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start_pos = event.position().toPoint()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if (
+            self._drag_start_pos is not None
+            and event.buttons() & Qt.MouseButton.LeftButton
+        ):
+            dist = (event.position().toPoint() - self._drag_start_pos).manhattanLength()
+            if dist >= QApplication.startDragDistance():
+                self._drag_start_pos = None
+                self._start_drag()
+                return
+        super().mouseMoveEvent(event)
+
+    def _start_drag(self) -> None:
+        image_path = self.asset.get("image_path", "")
+        if not image_path:
+            return
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(image_path)])
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        # Use the thumbnail as the drag pixmap so the user sees what they're dragging
+        pix = _load_pixmap(image_path)
+        if not pix.isNull():
+            drag.setPixmap(
+                pix.scaled(
+                    THUMB_W // 2,
+                    THUMB_H // 2,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+        drag.exec(Qt.DropAction.CopyAction)
 
     def enterEvent(self, event) -> None:
         self._hovered = True
@@ -830,7 +869,13 @@ class ResultsPanel(QScrollArea):
 
     def refresh(self, query: str = "") -> None:
         assets = self._db.search(query) if self._db else []
+        if assets:
+            # Show a message BEFORE the UI freezes while rendering all thumbnails.
+            # processEvents() flushes it to screen before the heavy _populate() call.
+            self.show_loading("Rendering images… this may take a moment")
+            QApplication.processEvents()
         self._populate(assets)
+        self.hide_loading()
 
     def show_loading(self, msg: str = "Loading…") -> None:
         self._overlay.set_message(msg)
@@ -1148,7 +1193,8 @@ class MainWindow(QMainWindow):
         self._set_status(msg)
 
     def _on_index_finished(self, name: str, total: int) -> None:
-        self._results.hide_loading()
+        # Don't hide the overlay yet — _set_active_db → refresh() will show
+        # "Rendering…" and hide the overlay once _populate() completes.
         self._search.setEnabled(True)
         self._menu_btn.setEnabled(True)
         self._set_active_db(name)
