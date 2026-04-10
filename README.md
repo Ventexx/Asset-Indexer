@@ -1,6 +1,6 @@
 # Asset-Indexer
 
-A desktop application for browsing, searching, and editing structured data paired with visual assets, organized into a fast and intuitive interface.
+A desktop application for browsing, searching, and editing structured data paired with visual assets, organized into a fast and intuitive interface, with native support for Windows and Linux.
 
 ![Cover Image](ScreenshotCover.png)
 
@@ -23,6 +23,7 @@ A desktop application for browsing, searching, and editing structured data paire
 ## Overview
 
 Asset Indexer is a desktop application that scans folders of image + JSON pairs and turns them into a searchable, visual data library. It allows you to quickly find, preview, copy, and edit structured data in an organized way.
+It features native support for Windows and Linux, with partial Wayland support.
 
 ---
 
