@@ -55,9 +55,9 @@ from PySide6.QtWidgets import (
 # ──────────────────────────────────────────────────────────────────────────────
 DEV_MODE: bool = "--dev" in sys.argv
 
-APP_NAME = "Prompt Indexer"
-APP_ORG = "PromptIndexer"
-APP_DIR = Path.home() / ".prompt_indexer"
+APP_NAME = "Asset Indexer"
+APP_ORG = "AssetIndexer"
+APP_DIR = Path.home() / ".asset_indexer"
 ICON_PATH = Path(__file__).parent / "Icon.png"
 PREFS_FILE = APP_DIR / "prefs.json"
 
