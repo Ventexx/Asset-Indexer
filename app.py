@@ -2,9 +2,15 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
+
+# ruff: noqa
+# Uncomment next 2 lines to force XWayland if Wayland causes issues:
+# import os
+# os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 from PySide6.QtCore import QMimeData, QPoint, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDrag, QIcon, QPainter, QPalette, QPixmap
@@ -29,6 +35,25 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+# ── Dev Mode ───────────────────────────────────────────────────────────────────
+# DEV_MODE is activated ONLY by passing --dev as a command-line argument.
+#
+# CONTRACT - read this before touching anything below:
+#   • DEV_MODE is a READ-ONLY boolean set once at import time from sys.argv.
+#   • It is COMPLETELY ISOLATED from all production code paths.
+#   • It NEVER writes to prefs, databases, scripts files, or any disk state.
+#   • It NEVER overwrites "last_db" so the user's real session is preserved.
+#   • The fake data and DevDatabase class defined in the _DEV section below
+#     are the ONLY things that change when DEV_MODE is True.
+#   • If DEV_MODE is False, none of the dev-mode symbols are ever referenced.
+#   • The "dev" database CANNOT be opened through the normal Open Database
+#     dialog - it only exists in memory while the flag is active.
+#
+# To start in dev mode:   python app.py --dev
+# Normal start:           python app.py
+# ──────────────────────────────────────────────────────────────────────────────
+DEV_MODE: bool = "--dev" in sys.argv
 
 APP_NAME = "Prompt Indexer"
 APP_ORG = "PromptIndexer"
@@ -59,6 +84,31 @@ def _save_prefs(data: dict) -> None:
     try:
         APP_DIR.mkdir(parents=True, exist_ok=True)
         PREFS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+# ── Startup Scripts ────────────────────────────────────────────────────────────
+
+SCRIPTS_FILE = APP_DIR / "startup_scripts.json"
+
+
+def _load_scripts() -> list[dict]:
+    """Return list of {name, path, args} dicts."""
+    try:
+        if SCRIPTS_FILE.exists():
+            data = json.loads(SCRIPTS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return data
+    except Exception:
+        pass
+    return []
+
+
+def _save_scripts(scripts: list[dict]) -> None:
+    try:
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        SCRIPTS_FILE.write_text(json.dumps(scripts, indent=2), encoding="utf-8")
     except Exception:
         pass
 
@@ -238,6 +288,255 @@ def _run_index(
         conn.close()
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ██  DEV-MODE SANDBOX  ████████████████████████████████████████████████████████
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Everything between the two ══ banners is EXCLUSIVELY for --dev mode.
+# NOTHING in this block is referenced from production code paths.
+# NOTHING in this block reads from or writes to disk (no DB, no prefs, no files).
+#
+# Structure:
+#   _DEV_FAKE_ASSETS   - hardcoded list of fake asset dicts (no real images/JSON)
+#   _DEV_FOLDER_META   - hardcoded folder copy-tag values
+#   DevDatabase        - in-memory stub that mimics the Database API exactly
+#                        but operates only on _DEV_FAKE_ASSETS; all mutating
+#                        methods (update_json, delete) are no-ops.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Fake assets: three folders, a handful of entries each.
+# image_path values are intentionally non-existent - _apply_pixmap will show "?".
+# json_data contains realistic example JSON so the context-menu copy actions
+# and the Edit JSON dialog both work (they just don't persist anything).
+_DEV_FAKE_ASSETS: list[dict] = [
+    # ── Folder: Characters ────────────────────────────────────────────────────
+    {
+        "id": 1,
+        "name": "hero_warrior",
+        "folder": "Characters",
+        "image_path": "/dev/null/Characters/hero_warrior.png",
+        "json_path": "/dev/null/Characters/hero_warrior.json",
+        "json_data": json.dumps(
+            {
+                "prompt": "a heroic warrior in gleaming plate armor, cinematic lighting",
+                "negative_prompt": "blurry, low quality",
+                "model": "stable-diffusion-xl",
+                "steps": 30,
+                "cfg_scale": 7.5,
+            },
+            indent=2,
+        ),
+    },
+    {
+        "id": 2,
+        "name": "rogue_elf",
+        "folder": "Characters",
+        "image_path": "/dev/null/Characters/rogue_elf.png",
+        "json_path": "/dev/null/Characters/rogue_elf.json",
+        "json_data": json.dumps(
+            {
+                "prompt": "nimble elven rogue, emerald cloak, forest background",
+                "negative_prompt": "ugly, deformed",
+                "model": "stable-diffusion-xl",
+                "steps": 25,
+                "cfg_scale": 6.0,
+            },
+            indent=2,
+        ),
+    },
+    {
+        "id": 3,
+        "name": "dark_mage",
+        "folder": "Characters",
+        "image_path": "/dev/null/Characters/dark_mage.png",
+        "json_path": "/dev/null/Characters/dark_mage.json",
+        "json_data": json.dumps(
+            {
+                "prompt": "dark sorcerer holding a glowing orb, dramatic shadows",
+                "negative_prompt": "cartoon, anime",
+                "model": "stable-diffusion-xl",
+                "steps": 40,
+                "cfg_scale": 8.0,
+            },
+            indent=2,
+        ),
+    },
+    # ── Folder: Landscapes ────────────────────────────────────────────────────
+    {
+        "id": 4,
+        "name": "misty_valley",
+        "folder": "Landscapes",
+        "image_path": "/dev/null/Landscapes/misty_valley.png",
+        "json_path": "/dev/null/Landscapes/misty_valley.json",
+        "json_data": json.dumps(
+            {
+                "prompt": "sweeping misty valley at dawn, volumetric fog, epic scale",
+                "negative_prompt": "oversaturated, flat",
+                "model": "stable-diffusion-xl",
+                "steps": 35,
+                "cfg_scale": 7.0,
+            },
+            indent=2,
+        ),
+    },
+    {
+        "id": 5,
+        "name": "crystal_cave",
+        "folder": "Landscapes",
+        "image_path": "/dev/null/Landscapes/crystal_cave.png",
+        "json_path": "/dev/null/Landscapes/crystal_cave.json",
+        "json_data": json.dumps(
+            {
+                "prompt": "underground crystal cave, bioluminescent glow, reflections",
+                "negative_prompt": "dark, muddy colors",
+                "model": "stable-diffusion-xl",
+                "steps": 30,
+                "cfg_scale": 7.5,
+            },
+            indent=2,
+        ),
+    },
+    {
+        "id": 6,
+        "name": "sky_fortress",
+        "folder": "Landscapes",
+        "image_path": "/dev/null/Landscapes/sky_fortress.png",
+        "json_path": "/dev/null/Landscapes/sky_fortress.json",
+        "json_data": json.dumps(
+            {
+                "prompt": "floating sky fortress above clouds, golden hour light",
+                "negative_prompt": "low detail, blurry",
+                "model": "stable-diffusion-xl",
+                "steps": 40,
+                "cfg_scale": 8.5,
+            },
+            indent=2,
+        ),
+    },
+    # ── Folder: Items ─────────────────────────────────────────────────────────
+    {
+        "id": 7,
+        "name": "magic_sword",
+        "folder": "Items",
+        "image_path": "/dev/null/Items/magic_sword.png",
+        "json_path": "/dev/null/Items/magic_sword.json",
+        "json_data": json.dumps(
+            {
+                "prompt": "ancient enchanted sword with glowing blue runes, product shot",
+                "negative_prompt": "hands, people",
+                "model": "stable-diffusion-xl",
+                "steps": 28,
+                "cfg_scale": 7.0,
+            },
+            indent=2,
+        ),
+    },
+    {
+        "id": 8,
+        "name": "potion_red",
+        "folder": "Items",
+        "image_path": "/dev/null/Items/potion_red.png",
+        "json_path": "/dev/null/Items/potion_red.json",
+        "json_data": json.dumps(
+            {
+                "prompt": "crimson health potion in ornate glass vial, studio lighting",
+                "negative_prompt": "background clutter",
+                "model": "stable-diffusion-xl",
+                "steps": 25,
+                "cfg_scale": 6.5,
+            },
+            indent=2,
+        ),
+    },
+    {
+        "id": 9,
+        "name": "ancient_tome",
+        "folder": "Items",
+        "image_path": "/dev/null/Items/ancient_tome.png",
+        "json_path": "/dev/null/Items/ancient_tome.json",
+        "json_data": json.dumps(
+            {
+                "prompt": "weathered spellbook with arcane symbols, candle light",
+                "negative_prompt": "modern, clean",
+                "model": "stable-diffusion-xl",
+                "steps": 32,
+                "cfg_scale": 7.0,
+            },
+            indent=2,
+        ),
+    },
+]
+
+# Folder copy-tag values (simulates !F-<Name>.json in each folder)
+_DEV_FOLDER_META: dict[str, str] = {
+    "Characters": "<lora:char_pack_v2:0.8>",
+    "Landscapes": "<lora:landscape_v3:0.9>",
+    "Items": "<lora:items_v1:0.7>",
+}
+
+
+class DevDatabase:
+    """
+    ──────────────────────────────────────────────────────────────────────────
+    DEV-ONLY in-memory database stub.  Mirrors the public API of Database so
+    the rest of the UI code works without any special-casing inside widgets.
+
+    RULES (do not break these):
+      • Never reads from or writes to any file or SQLite database.
+      • update_json() only mutates the in-memory list - changes vanish on exit.
+      • delete() is a silent no-op (cards appear to stay; a refresh restores).
+      • get_folder_meta() returns values from the hardcoded _DEV_FOLDER_META dict.
+      • This class MUST NOT be instantiated outside of DEV_MODE code paths.
+    ──────────────────────────────────────────────────────────────────────────
+    """
+
+    def __init__(self) -> None:
+        # Work on a shallow copy so multiple resets don't stack mutations
+        self._assets: list[dict] = [dict(a) for a in _DEV_FAKE_ASSETS]
+        self.path = Path("/dev/null/dev_mode.db")  # sentinel - never accessed
+        self.name = "[DEV MODE]"
+
+    # ── API surface (matches Database) ────────────────────────────────────
+
+    def search(self, query: str, limit: int = 2000) -> list[dict]:
+        """Filter fake assets by name, case-insensitive substring match."""
+        q = query.lower()
+        results = (
+            [a for a in self._assets if q in a["name"].lower()]
+            if q
+            else list(self._assets)
+        )
+        return results[:limit]
+
+    def get_folder_meta(self, folder_key: str) -> Optional[str]:
+        """Return the hardcoded copy-tag for a folder, or None."""
+        return _DEV_FOLDER_META.get(folder_key)
+
+    def update_json(self, image_path: str, new_json_text: str) -> None:
+        """
+        DEV NO-OP: Updates the in-memory asset only.
+        The Edit JSON dialog will show a Save confirmation, but nothing is
+        written to disk and changes reset the moment the panel refreshes.
+        """
+        for asset in self._assets:
+            if asset["image_path"] == image_path:
+                asset["json_data"] = new_json_text
+                break  # in-memory only, not persisted
+
+    def delete(self, image_path: str) -> None:
+        """DEV NO-OP: silently ignores delete requests."""
+        pass  # intentional no-op - dev mode does not mutate state visibly
+
+    def close(self) -> None:
+        """DEV NO-OP: nothing to close."""
+        pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ██  END DEV-MODE SANDBOX  ████████████████████████████████████████████████████
+# ══════════════════════════════════════════════════════════════════════════════
+
+
 # ── Database ───────────────────────────────────────────────────────────────────
 
 
@@ -365,6 +664,23 @@ class DatabaseManager:
         self._save()
         return name
 
+    def remove(self, name: str) -> None:
+        """Remove a database entry and delete its .db file if it exists."""
+        # Close and unload from memory first
+        db = self._dbs.pop(name, None)
+        if db:
+            db.close()
+        # Delete the .db file if it exists (gracefully skip if already gone)
+        db_file = APP_DIR / f"{name}.db"
+        try:
+            if db_file.exists():
+                db_file.unlink()
+        except Exception:
+            pass
+        # Remove from roots registry and persist
+        self._roots.pop(name, None)
+        self._save()
+
     def close_all(self) -> None:
         for db in self._dbs.values():
             db.close()
@@ -393,7 +709,7 @@ class LoadingOverlay(QWidget):
         self._dots_lbl.setObjectName("loadingDots")
         self._dots_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        self._msg_lbl = QLabel("Loading…")
+        self._msg_lbl = QLabel("Loading...")
         self._msg_lbl.setObjectName("loadingMsg")
         self._msg_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
@@ -515,7 +831,7 @@ class EditJsonDialog(_DraggableDialog):
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
-        # Shadow container — transparent, just for the drop-shadow effect
+        # Shadow container - transparent, just for the drop-shadow effect
         shadow_frame = QFrame(self)
         shadow_frame.setObjectName("dialogShadow")
         shadow_frame.setGeometry(4, 4, self.W - 4, self.H - 4)
@@ -564,10 +880,10 @@ class EditJsonDialog(_DraggableDialog):
         self._editor = QPlainTextEdit()
         self._editor.setObjectName("jsonEditor")
 
-        # Load raw JSON from disk
+        # Load raw JSON - in dev mode the json_path is a fake sentinel, so skip disk
         json_path = asset.get("json_path", "")
         raw = ""
-        if json_path and Path(json_path).exists():
+        if not DEV_MODE and json_path and Path(json_path).exists():
             try:
                 raw = Path(json_path).read_text(encoding="utf-8", errors="ignore")
             except Exception:
@@ -620,13 +936,17 @@ class EditJsonDialog(_DraggableDialog):
             QMessageBox.warning(self, APP_NAME, f"Invalid JSON:\n{e}")
             return
 
-        json_path = self._asset.get("json_path", "")
-        if json_path:
-            try:
-                Path(json_path).write_text(new_text, encoding="utf-8")
-            except Exception as exc:
-                QMessageBox.critical(self, APP_NAME, f"Could not write file:\n{exc}")
-                return
+        # ── DEV MODE: skip ALL disk I/O; only update the in-memory stub ───────
+        if not DEV_MODE:
+            json_path = self._asset.get("json_path", "")
+            if json_path:
+                try:
+                    Path(json_path).write_text(new_text, encoding="utf-8")
+                except Exception as exc:
+                    QMessageBox.critical(
+                        self, APP_NAME, f"Could not write file:\n{exc}"
+                    )
+                    return
 
         if self._db:
             self._db.update_json(self._asset["image_path"], new_text)
@@ -785,7 +1105,7 @@ class ThumbnailCard(QWidget):
         if data:
             menu.addSeparator()
 
-        edit_act = menu.addAction("Edit JSON…")
+        edit_act = menu.addAction("Edit JSON...")
         chosen = menu.exec(event.globalPos())
         if chosen is None:
             return
@@ -845,7 +1165,7 @@ class FolderSection(QWidget):
 
         hc_lay.addWidget(self._header)
 
-        # Copy button — only created when this folder has an !F-*.json
+        # Copy button - only created when this folder has an !F-*.json
         self._copy_btn: Optional[QToolButton] = None
         if copy_value:
             btn = QToolButton()
@@ -853,7 +1173,8 @@ class FolderSection(QWidget):
             btn.setObjectName("folderCopyBtn")
             btn.setToolTip("Copy Folder Tag")
             btn.setVisible(False)  # shown only when expanded
-            btn.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+            btn.setFixedHeight(16)
+            btn.adjustSize()
             btn.clicked.connect(self._copy_meta_value)
             hc_lay.addWidget(btn)
             self._copy_btn = btn
@@ -983,12 +1304,12 @@ class ResultsPanel(QScrollArea):
         if assets:
             # Show a message BEFORE the UI freezes while rendering all thumbnails.
             # processEvents() flushes it to screen before the heavy _populate() call.
-            self.show_loading("Rendering images… this may take a moment")
+            self.show_loading("Rendering images... this may take a moment")
             QApplication.processEvents()
         self._populate(assets)
         self.hide_loading()
 
-    def show_loading(self, msg: str = "Loading…") -> None:
+    def show_loading(self, msg: str = "Loading...") -> None:
         self._overlay.set_message(msg)
         self._overlay.show()
         self._overlay.raise_()
@@ -1071,12 +1392,118 @@ class ResultsPanel(QScrollArea):
 # ── Open Database Dialog ───────────────────────────────────────────────────────
 
 
+class ConfirmRemoveDialog(_DraggableDialog):
+    """Styled confirmation dialog used by OpenDatabaseDialog's Remove action."""
+
+    _PREFS_KEY = ""  # not persisted
+    W, H = 300, 160
+
+    def __init__(self, db_name: str, parent=None):
+        super().__init__(parent)
+        self.setModal(True)
+        self.setFixedSize(self.W, self.H)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        shadow_frame = QFrame(self)
+        shadow_frame.setObjectName("dialogShadow")
+        shadow_frame.setGeometry(4, 4, self.W - 4, self.H - 4)
+
+        frame = QFrame(self)
+        frame.setObjectName("editDialogFrame")
+        frame.setGeometry(0, 0, self.W - 4, self.H - 4)
+
+        lay = QVBoxLayout(frame)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        # ── Header ────────────────────────────────────────────────────────
+        header = QWidget()
+        header.setObjectName("editDialogHeader")
+        header.setFixedHeight(26)
+        h_lay = QHBoxLayout(header)
+        h_lay.setContentsMargins(14, 0, 10, 0)
+        h_lay.setSpacing(8)
+
+        dot = QWidget()
+        dot.setObjectName("editDialogDot")
+        dot.setFixedSize(6, 6)
+
+        title_lbl = QLabel("Remove Database")
+        title_lbl.setObjectName("editDialogTitle")
+
+        close_btn = QToolButton()
+        close_btn.setText("✕")
+        close_btn.setObjectName("dbDialogClose")
+        close_btn.setFixedSize(18, 18)
+        close_btn.clicked.connect(self.reject)
+
+        h_lay.addWidget(dot)
+        h_lay.addWidget(title_lbl)
+        h_lay.addStretch()
+        h_lay.addWidget(close_btn)
+        lay.addWidget(header)
+
+        sep = QFrame()
+        sep.setObjectName("dbDialogSep")
+        sep.setFrameShape(QFrame.Shape.HLine)
+        lay.addWidget(sep)
+
+        # ── Body ──────────────────────────────────────────────────────────
+        body = QWidget()
+        b_lay = QVBoxLayout(body)
+        b_lay.setContentsMargins(16, 12, 16, 8)
+        b_lay.setSpacing(6)
+
+        main_lbl = QLabel(f'Remove "{db_name}"?')
+        main_lbl.setObjectName("confirmMainLbl")
+        main_lbl.setWordWrap(True)
+
+        info_lbl = QLabel(
+            "This deletes the index file. Your original asset folder will not be touched."
+        )
+        info_lbl.setObjectName("confirmInfoLbl")
+        info_lbl.setWordWrap(True)
+
+        b_lay.addWidget(main_lbl)
+        b_lay.addWidget(info_lbl)
+        b_lay.addStretch()
+        lay.addWidget(body, 1)
+
+        sep2 = QFrame()
+        sep2.setObjectName("dbDialogSep")
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        lay.addWidget(sep2)
+
+        # ── Footer: Yes (left accent), Cancel (right ghost) ───────────────
+        footer = QWidget()
+        footer.setObjectName("editDialogFooter")
+        f_lay = QHBoxLayout(footer)
+        f_lay.setContentsMargins(10, 5, 10, 6)
+        f_lay.setSpacing(0)
+
+        yes_btn = QPushButton("Yes, Remove")
+        yes_btn.setObjectName("editSaveBtn")
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setObjectName("editCancelBtn")
+
+        f_lay.addWidget(yes_btn)
+        f_lay.addStretch()
+        f_lay.addWidget(cancel_btn)
+        lay.addWidget(footer)
+
+        yes_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
+
+
 class OpenDatabaseDialog(_DraggableDialog):
     _PREFS_KEY = "open_db_pos"
     W, H = 280, 320
 
     def __init__(self, db_manager: DatabaseManager, current: str, parent=None):
         super().__init__(parent)
+        self._db_manager = db_manager
         self.setWindowTitle("Change Database")
         self.setModal(True)
         self.setFixedSize(self.W, self.H)
@@ -1161,7 +1588,13 @@ class OpenDatabaseDialog(_DraggableDialog):
         ok_btn = QPushButton("Open")
         ok_btn.setObjectName("editSaveBtn")
 
+        self._remove_db_btn = QPushButton("Remove")
+        self._remove_db_btn.setObjectName("dbRemoveBtn")
+        self._remove_db_btn.setEnabled(False)
+
         f_lay.addWidget(ok_btn)
+        f_lay.addStretch()
+        f_lay.addWidget(self._remove_db_btn)
         f_lay.addStretch()
         f_lay.addWidget(cancel_btn)
         lay.addWidget(footer)
@@ -1169,14 +1602,428 @@ class OpenDatabaseDialog(_DraggableDialog):
         ok_btn.clicked.connect(self._accept)
         cancel_btn.clicked.connect(self.reject)
         self._list.itemDoubleClicked.connect(self._accept)
+        self._list.currentRowChanged.connect(self._on_selection_changed)
+        self._remove_db_btn.clicked.connect(self._remove_db)
 
         self._restore_pos()
+
+    def _on_selection_changed(self, row: int) -> None:
+        self._remove_db_btn.setEnabled(row >= 0)
+
+    def _remove_db(self) -> None:
+        item = self._list.currentItem()
+        if not item:
+            return
+        name = item.text()
+        dlg = ConfirmRemoveDialog(name, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._db_manager.remove(name)
+        # Remove from list widget
+        row = self._list.currentRow()
+        self._list.takeItem(row)
+        # If the removed db was the current/chosen one, clear chosen
+        if self.chosen == name:
+            self.chosen = ""
+        self._remove_db_btn.setEnabled(False)
 
     def _accept(self) -> None:
         item = self._list.currentItem()
         if item:
             self.chosen = item.text()
         self.accept()
+
+
+# ── Script Runner ──────────────────────────────────────────────────────────────
+
+
+class ScriptRunner(QThread):
+    """Runs startup scripts sequentially in a background thread."""
+
+    progress = Signal(int, int, str)  # current, total, message
+    finished = Signal()
+
+    def __init__(self, scripts: list[dict]):
+        super().__init__()
+        self._scripts = scripts
+
+    def run(self) -> None:
+        total = len(self._scripts)
+        for i, entry in enumerate(self._scripts, 1):
+            self.progress.emit(i, total, f"Executing Startup Scripts ({i}/{total})")
+            cmd = f'python "{entry["path"]}"'
+            if entry.get("args", "").strip():
+                cmd += f" {entry['args'].strip()}"
+            try:
+                subprocess.run(cmd, shell=True, check=False)
+            except Exception:
+                pass
+        self.finished.emit()
+
+
+# ── Add Script Dialog ──────────────────────────────────────────────────────────
+
+
+class AddScriptDialog(_DraggableDialog):
+    _PREFS_KEY = "add_script_pos"
+    W, H = 340, 262
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.script_path: str = ""
+        self.script_args: str = ""
+        self.script_name: str = ""
+        self.setWindowTitle("Add Script")
+        self.setModal(True)
+        self.setFixedSize(self.W, self.H)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        shadow_frame = QFrame(self)
+        shadow_frame.setObjectName("dialogShadow")
+        shadow_frame.setGeometry(4, 4, self.W - 4, self.H - 4)
+
+        frame = QFrame(self)
+        frame.setObjectName("editDialogFrame")
+        frame.setGeometry(0, 0, self.W - 4, self.H - 4)
+
+        lay = QVBoxLayout(frame)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        # Header
+        header = QWidget()
+        header.setObjectName("editDialogHeader")
+        header.setFixedHeight(26)
+        h_lay = QHBoxLayout(header)
+        h_lay.setContentsMargins(14, 0, 10, 0)
+        h_lay.setSpacing(8)
+        dot = QWidget()
+        dot.setObjectName("editDialogDot")
+        dot.setFixedSize(6, 6)
+        title_lbl = QLabel("Add Script")
+        title_lbl.setObjectName("editDialogTitle")
+        close_btn = QToolButton()
+        close_btn.setText("✕")
+        close_btn.setObjectName("dbDialogClose")
+        close_btn.setFixedSize(18, 18)
+        close_btn.clicked.connect(self.reject)
+        h_lay.addWidget(dot)
+        h_lay.addWidget(title_lbl)
+        h_lay.addStretch()
+        h_lay.addWidget(close_btn)
+        lay.addWidget(header)
+
+        sep = QFrame()
+        sep.setObjectName("dbDialogSep")
+        sep.setFrameShape(QFrame.Shape.HLine)
+        lay.addWidget(sep)
+
+        # Body
+        body = QWidget()
+        b_lay = QVBoxLayout(body)
+        b_lay.setContentsMargins(14, 10, 14, 8)
+        b_lay.setSpacing(8)
+
+        notice = QLabel("Note: the script relies on its path not changing.")
+        notice.setObjectName("scriptNotice")
+        notice.setWordWrap(True)
+        b_lay.addWidget(notice)
+
+        self._path_btn = QPushButton("Select Python Script...")
+        self._path_btn.setObjectName("editSaveBtn")
+        self._path_btn.clicked.connect(self._pick_script)
+        b_lay.addWidget(self._path_btn)
+
+        self._name_edit = QLineEdit()
+        self._name_edit.setObjectName("scriptArgsEdit")
+        self._name_edit.setPlaceholderText("Script name  (auto-filled from filename)")
+        self._name_edit.setFixedHeight(24)
+        b_lay.addWidget(self._name_edit)
+
+        self._args_edit = QLineEdit()
+        self._args_edit.setObjectName("scriptArgsEdit")
+        self._args_edit.setPlaceholderText(
+            "Execute arguments  (e.g. -r C:/some/folder)"
+        )
+        self._args_edit.setFixedHeight(24)
+        b_lay.addWidget(self._args_edit)
+
+        b_lay.addStretch()
+        lay.addWidget(body, 1)
+
+        sep2 = QFrame()
+        sep2.setObjectName("dbDialogSep")
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        lay.addWidget(sep2)
+
+        footer = QWidget()
+        footer.setObjectName("editDialogFooter")
+        f_lay = QHBoxLayout(footer)
+        f_lay.setContentsMargins(10, 5, 10, 6)
+        f_lay.setSpacing(0)
+        add_btn = QPushButton("Add")
+        add_btn.setObjectName("editSaveBtn")
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setObjectName("editCancelBtn")
+        f_lay.addWidget(add_btn)
+        f_lay.addStretch()
+        f_lay.addWidget(cancel_btn)
+        lay.addWidget(footer)
+
+        add_btn.clicked.connect(self._accept)
+        cancel_btn.clicked.connect(self.reject)
+        self._restore_pos()
+
+    def _pick_script(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Python Script", "", "Python Scripts (*.py)"
+        )
+        if path:
+            self.script_path = path
+            self._path_btn.setText(Path(path).name)
+            # Auto-fill name only if the user hasn't typed one yet
+            if not self._name_edit.text().strip():
+                self._name_edit.setText(Path(path).stem)
+
+    def _accept(self) -> None:
+        if not self.script_path:
+            QMessageBox.warning(self, APP_NAME, "Please select a Python script first.")
+            return
+        self.script_name = self._name_edit.text().strip() or Path(self.script_path).stem
+        self.script_args = self._args_edit.text().strip()
+        self.accept()
+
+
+# ── Startup Scripts Dialog ─────────────────────────────────────────────────────
+
+
+class StartupScriptsDialog(_DraggableDialog):
+    _PREFS_KEY = "startup_scripts_pos"
+    W, H = 280, 340
+
+    def __init__(self, parent=None, readonly: bool = False):
+        super().__init__(parent)
+        # ── DEV MODE: when readonly=True all _save() calls are no-ops.
+        #    The dialog is fully interactive - add, remove, reorder, edit all
+        #    work visually - but nothing is written to startup_scripts.json.
+        #    Changes are lost when the dialog closes. The real scripts file on
+        #    disk is left completely untouched.
+        self._save_scripts = (lambda _scripts: None) if readonly else _save_scripts
+
+        self.setWindowTitle(
+            "Startup Scripts" + ("  [dev - changes not saved]" if readonly else "")
+        )
+        self.setModal(True)
+        self.setFixedSize(self.W, self.H)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        self._scripts: list[dict] = _load_scripts()
+
+        shadow_frame = QFrame(self)
+        shadow_frame.setObjectName("dialogShadow")
+        shadow_frame.setGeometry(4, 4, self.W - 4, self.H - 4)
+
+        frame = QFrame(self)
+        frame.setObjectName("editDialogFrame")
+        frame.setGeometry(0, 0, self.W - 4, self.H - 4)
+
+        lay = QVBoxLayout(frame)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        # Header
+        header = QWidget()
+        header.setObjectName("editDialogHeader")
+        header.setFixedHeight(26)
+        h_lay = QHBoxLayout(header)
+        h_lay.setContentsMargins(14, 0, 10, 0)
+        h_lay.setSpacing(8)
+        dot = QWidget()
+        dot.setObjectName("editDialogDot")
+        dot.setFixedSize(6, 6)
+        title_lbl = QLabel("Startup Scripts")
+        title_lbl.setObjectName("editDialogTitle")
+        close_btn = QToolButton()
+        close_btn.setText("✕")
+        close_btn.setObjectName("dbDialogClose")
+        close_btn.setFixedSize(18, 18)
+        close_btn.clicked.connect(self.reject)
+        h_lay.addWidget(dot)
+        h_lay.addWidget(title_lbl)
+        h_lay.addStretch()
+        h_lay.addWidget(close_btn)
+        lay.addWidget(header)
+
+        sep = QFrame()
+        sep.setObjectName("dbDialogSep")
+        sep.setFrameShape(QFrame.Shape.HLine)
+        lay.addWidget(sep)
+
+        # List
+        list_wrap = QWidget()
+        list_wrap.setObjectName("dbListWrap")
+        lw_lay = QVBoxLayout(list_wrap)
+        lw_lay.setContentsMargins(8, 6, 8, 4)
+        lw_lay.setSpacing(0)
+        self._list = QListWidget()
+        self._list.setObjectName("dbDialogList")
+        self._list.setFrameShape(QFrame.Shape.NoFrame)
+        self._list.currentRowChanged.connect(self._on_selection_changed)
+        lw_lay.addWidget(self._list)
+        lay.addWidget(list_wrap, 1)
+        self._refresh_list()
+
+        sep2 = QFrame()
+        sep2.setObjectName("dbDialogSep")
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        lay.addWidget(sep2)
+
+        # Footer with +/- and ↑/↓ buttons centered
+        footer = QWidget()
+        footer.setObjectName("editDialogFooter")
+        f_lay = QHBoxLayout(footer)
+        f_lay.setContentsMargins(10, 6, 10, 7)
+        f_lay.setSpacing(6)
+
+        self._up_btn = QToolButton()
+        self._up_btn.setText("↑")
+        self._up_btn.setObjectName("scriptOrderBtn")
+        self._up_btn.setFixedSize(22, 22)
+        self._up_btn.setToolTip("Move Up")
+        self._up_btn.setEnabled(False)
+        self._up_btn.clicked.connect(self._move_up)
+
+        self._down_btn = QToolButton()
+        self._down_btn.setText("↓")
+        self._down_btn.setObjectName("scriptOrderBtn")
+        self._down_btn.setFixedSize(22, 22)
+        self._down_btn.setToolTip("Move Down")
+        self._down_btn.setEnabled(False)
+        self._down_btn.clicked.connect(self._move_down)
+
+        self._edit_btn = QToolButton()
+        self._edit_btn.setText("Edit")
+        self._edit_btn.setObjectName("scriptEditBtn")
+        self._edit_btn.setFixedSize(48, 20)
+        self._edit_btn.setToolTip("Edit Script")
+        self._edit_btn.setEnabled(False)
+        self._edit_btn.clicked.connect(self._edit_script)
+
+        self._add_btn = QToolButton()
+        self._add_btn.setText("+")
+        self._add_btn.setObjectName("scriptAddBtn")
+        self._add_btn.setFixedSize(22, 22)
+        self._add_btn.setToolTip("Add Script")
+        self._add_btn.clicked.connect(self._add_script)
+
+        self._remove_btn = QToolButton()
+        self._remove_btn.setText("−")
+        self._remove_btn.setObjectName("scriptRemoveBtn")
+        self._remove_btn.setFixedSize(22, 22)
+        self._remove_btn.setToolTip("Remove Script")
+        self._remove_btn.setEnabled(False)
+        self._remove_btn.clicked.connect(self._remove_script)
+
+        f_lay.addStretch()
+        f_lay.addWidget(self._up_btn)
+        f_lay.addWidget(self._down_btn)
+        f_lay.addSpacing(8)
+        f_lay.addWidget(self._edit_btn)
+        f_lay.addSpacing(8)
+        f_lay.addWidget(self._add_btn)
+        f_lay.addWidget(self._remove_btn)
+        f_lay.addStretch()
+        lay.addWidget(footer)
+
+        self._restore_pos()
+
+    def _refresh_list(self) -> None:
+        row = self._list.currentRow()
+        self._list.clear()
+        for s in self._scripts:
+            self._list.addItem(s["name"])
+        # Restore selection if possible
+        if 0 <= row < self._list.count():
+            self._list.setCurrentRow(row)
+
+    def _on_selection_changed(self, row: int) -> None:
+        has = row >= 0
+        count = len(self._scripts)
+        self._remove_btn.setEnabled(has)
+        self._edit_btn.setEnabled(has)
+        self._up_btn.setEnabled(has and row > 0)
+        self._down_btn.setEnabled(has and row < count - 1)
+
+    def _edit_script(self) -> None:
+        row = self._list.currentRow()
+        if row < 0:
+            return
+        entry = self._scripts[row]
+        dlg = AddScriptDialog(self)
+        # Pre-fill the dialog with the existing values
+        dlg.setWindowTitle("Edit Script")
+        dlg.script_path = entry["path"]
+        dlg._path_btn.setText(
+            Path(entry["path"]).name if entry["path"] else "Select Python Script..."
+        )
+        dlg._name_edit.setText(entry.get("name", ""))
+        dlg._args_edit.setText(entry.get("args", ""))
+        if dlg.exec():
+            self._scripts[row] = {
+                "name": dlg.script_name,
+                "path": dlg.script_path,
+                "args": dlg.script_args,
+            }
+            self._save_scripts(self._scripts)
+            self._refresh_list()
+            self._list.setCurrentRow(row)
+
+    def _add_script(self) -> None:
+        dlg = AddScriptDialog(self)
+        if dlg.exec():
+            entry = {
+                "name": dlg.script_name,
+                "path": dlg.script_path,
+                "args": dlg.script_args,
+            }
+            self._scripts.append(entry)
+            self._save_scripts(self._scripts)
+            self._refresh_list()
+            self._list.setCurrentRow(len(self._scripts) - 1)
+
+    def _remove_script(self) -> None:
+        row = self._list.currentRow()
+        if row >= 0:
+            del self._scripts[row]
+            self._save_scripts(self._scripts)
+            self._refresh_list()
+
+    def _move_up(self) -> None:
+        row = self._list.currentRow()
+        if row > 0:
+            self._scripts[row - 1], self._scripts[row] = (
+                self._scripts[row],
+                self._scripts[row - 1],
+            )
+            self._save_scripts(self._scripts)
+            self._list.setCurrentRow(
+                row - 1
+            )  # triggers _on_selection_changed via signal
+            self._refresh_list()
+            self._list.setCurrentRow(row - 1)
+
+    def _move_down(self) -> None:
+        row = self._list.currentRow()
+        if row < len(self._scripts) - 1:
+            self._scripts[row], self._scripts[row + 1] = (
+                self._scripts[row + 1],
+                self._scripts[row],
+            )
+            self._save_scripts(self._scripts)
+            self._refresh_list()
+            self._list.setCurrentRow(row + 1)
 
 
 # ── Main Window ────────────────────────────────────────────────────────────────
@@ -1189,8 +2036,15 @@ class MainWindow(QMainWindow):
         self._active_db = ""
         self._app_menu: Optional[QMenu] = None
         self._index_worker: Optional[IndexWorker] = None
+        self._script_runner: Optional[ScriptRunner] = None
 
-        self.setWindowTitle(APP_NAME)
+        # ── DEV MODE: create the in-memory stub database once here.
+        #    This reference is ONLY ever used when DEV_MODE is True.
+        #    It is never stored to prefs, never written to disk.
+        self._dev_db: Optional[DevDatabase] = DevDatabase() if DEV_MODE else None
+
+        title = f"{APP_NAME}  [DEV MODE - fake data only]" if DEV_MODE else APP_NAME
+        self.setWindowTitle(title)
         self.setMinimumSize(560, 460)
         self.resize(1000, 720)
         if ICON_PATH.exists():
@@ -1213,7 +2067,7 @@ class MainWindow(QMainWindow):
         self._menu_btn.clicked.connect(self._toggle_app_menu)
 
         self._search = QLineEdit()
-        self._search.setPlaceholderText("Press / to search…")
+        self._search.setPlaceholderText("Press / to search...")
         self._search.setFixedHeight(26)
         self._search.textChanged.connect(self._on_search_text_changed)
 
@@ -1235,7 +2089,7 @@ class MainWindow(QMainWindow):
         sb_lay.setContentsMargins(8, 0, 8, 0)
         sb_lay.setSpacing(8)
 
-        self._db_lbl = QLabel("—")
+        self._db_lbl = QLabel("-")
         self._db_lbl.setObjectName("dbLbl")
 
         dot = QLabel("·")
@@ -1254,7 +2108,47 @@ class MainWindow(QMainWindow):
         self._results = ResultsPanel()
         self._results.setMinimumHeight(340)
         outer.addWidget(self._results, 1)
+        # Indexing is started by run_startup_scripts() called after show()
 
+    # ── Startup script execution ──────────────────────────────────────────
+
+    def run_startup_scripts(self) -> None:
+        """Run saved startup scripts then begin indexing. Called after show()."""
+        # ── DEV MODE BRANCH ───────────────────────────────────────────────────
+        # When --dev is active we skip ALL startup scripts and ALL real database
+        # loading.  We inject the in-memory DevDatabase directly into the results
+        # panel and display a status message.  No prefs are read or written here.
+        # ─────────────────────────────────────────────────────────────────────
+        if DEV_MODE:
+            self._db_lbl.setText("[DEV MODE]")
+            self._set_status("Dev mode - fake data, no disk access")
+            self._results.set_db(self._dev_db)  # type: ignore[arg-type]
+            self._do_search()
+            return
+        # ── PRODUCTION PATH (unchanged) ───────────────────────────────────────
+        scripts = _load_scripts()
+        if not scripts:
+            self._pick_initial_db()
+            return
+
+        self._results.show_loading(f"Executing Startup Scripts (1/{len(scripts)})")
+        self._search.setEnabled(False)
+        self._menu_btn.setEnabled(False)
+
+        runner = ScriptRunner(scripts)
+        runner.progress.connect(self._on_script_progress)
+        runner.finished.connect(self._on_scripts_finished)
+        self._script_runner = runner
+        runner.start()
+
+    def _on_script_progress(self, current: int, total: int, msg: str) -> None:
+        self._results.update_loading(msg)
+        self._set_status(msg)
+
+    def _on_scripts_finished(self) -> None:
+        self._script_runner = None
+        self._search.setEnabled(True)
+        self._menu_btn.setEnabled(True)
         self._pick_initial_db()
 
     # ── Helpers ───────────────────────────────────────────────────────────
@@ -1264,17 +2158,19 @@ class MainWindow(QMainWindow):
         last = prefs.get("last_db", "")
         names = self.db_manager.names()
         if not names:
-            self._set_status("No folders yet — use ≡ → Add Folder")
+            self._set_status("No folders yet - use ≡ → Add Folder")
             return
         target = last if last in names else names[0]
         self._start_load_db(target)
 
     def _set_active_db(self, name: str) -> None:
         self._active_db = name
-        self._db_lbl.setText(name or "—")
-        prefs = _load_prefs()
-        prefs["last_db"] = name
-        _save_prefs(prefs)
+        self._db_lbl.setText(name or "-")
+        # ── DEV MODE: never overwrite last_db - user's real session must survive
+        if not DEV_MODE:
+            prefs = _load_prefs()
+            prefs["last_db"] = name
+            _save_prefs(prefs)
         db = self.db_manager.get(name) if name else None
         self._results.set_db(db)
         self._do_search()
@@ -1285,9 +2181,9 @@ class MainWindow(QMainWindow):
             return  # already busy
 
         self._active_db = name
-        self._db_lbl.setText(name or "—")
-        self._set_status("Starting…")
-        self._results.show_loading("Starting…")
+        self._db_lbl.setText(name or "-")
+        self._set_status("Starting...")
+        self._results.show_loading("Starting...")
         self._search.setEnabled(False)
         self._menu_btn.setEnabled(False)
 
@@ -1311,8 +2207,8 @@ class MainWindow(QMainWindow):
         self._set_status(msg)
 
     def _on_index_finished(self, name: str, total: int) -> None:
-        # Don't hide the overlay yet — _set_active_db → refresh() will show
-        # "Rendering…" and hide the overlay once _populate() completes.
+        # Don't hide the overlay yet - _set_active_db → refresh() will show
+        # "Rendering..." and hide the overlay once _populate() completes.
         self._search.setEnabled(True)
         self._menu_btn.setEnabled(True)
         self._set_active_db(name)
@@ -1338,9 +2234,14 @@ class MainWindow(QMainWindow):
             return
 
         menu = QMenu(self)
+        # ── DEV MODE: annotate menu items that are suppressed or limited ──────
+        if DEV_MODE:
+            menu.addAction("⚠ Dev Mode Active - no real DB loaded").setEnabled(False)
+            menu.addSeparator()
         menu.addAction("Reload Database", self._action_reload)
         menu.addAction("Change Database", self._action_open_db)
         menu.addAction("Add Folder", self._action_add_folder)
+        menu.addAction("Startup Scripts", self._action_startup_scripts)
         menu.aboutToHide.connect(self._on_menu_hide)
         self._app_menu = menu
         menu.exec(self._menu_btn.mapToGlobal(self._menu_btn.rect().bottomLeft()))
@@ -1349,6 +2250,12 @@ class MainWindow(QMainWindow):
         self._app_menu = None
 
     def _action_reload(self) -> None:
+        # ── DEV MODE: reset the in-memory stub and re-render fake data ────────
+        if DEV_MODE:
+            self._dev_db = DevDatabase()
+            self._results.set_db(self._dev_db)  # type: ignore[arg-type]
+            self._do_search()
+            return
         if self._active_db:
             self._start_load_db(self._active_db)
 
@@ -1371,6 +2278,12 @@ class MainWindow(QMainWindow):
         if self._active_db:
             self.db_manager.unload(self._active_db)
         self._start_load_db(name)
+
+    def _action_startup_scripts(self) -> None:
+        # ── DEV MODE: open dialog in readonly mode - fully interactive but
+        #    nothing is written to disk. Changes are lost on close.
+        dlg = StartupScriptsDialog(self, readonly=DEV_MODE)
+        dlg.exec()
 
     # ── Keyboard shortcuts ────────────────────────────────────────────────
 
@@ -1493,10 +2406,10 @@ def apply_style(app: QApplication) -> None:
             border: 1px solid rgba(123,142,232,0.20);
             border-radius: 3px;
             color: rgba(123,142,232,0.45);
-            font-size: 9px;
+            font-size: 8px;
             font-weight: 500;
             letter-spacing: 0.2px;
-            padding: 1px 5px;
+            padding: 1px 4px 0px 4px;
         }}
         #folderCopyBtn:hover {{
             background: {ACCENT_DIM};
@@ -1616,7 +2529,7 @@ def apply_style(app: QApplication) -> None:
         /* ── dialog footer ───────────────────────────────────────────── */
         #editDialogFooter {{ background: transparent; }}
 
-        /* Cancel — ghost */
+        /* Cancel - ghost */
         #editCancelBtn {{
             background: transparent;
             border: 1px solid rgba(255,255,255,0.08);
@@ -1625,7 +2538,19 @@ def apply_style(app: QApplication) -> None:
         }}
         #editCancelBtn:hover {{ background: rgba(255,255,255,0.04); color: {TEXT_SEC}; }}
 
-        /* Save / Open — accent */
+        /* Remove DB - red, disabled when nothing selected */
+        #dbRemoveBtn {{
+            background: rgba(180,60,60,0.18);
+            border: 1px solid rgba(200,70,70,0.35);
+            border-radius: 4px; padding: 3px 12px;
+            font-size: 11px; font-weight: 600;
+            color: rgba(220,90,90,0.90);
+        }}
+        #dbRemoveBtn:hover  {{ background: rgba(200,70,70,0.30); border-color: rgba(220,80,80,0.60); color: rgb(240,100,100); }}
+        #dbRemoveBtn:pressed {{ background: rgba(180,60,60,0.10); }}
+        #dbRemoveBtn:disabled {{ background: transparent; border-color: rgba(255,255,255,0.06); color: rgba(255,255,255,0.18); }}
+
+        /* Save / Open - accent */
         #editSaveBtn {{
             background: {ACCENT_DIM};
             border: 1px solid {ACCENT_MID};
@@ -1664,6 +2589,82 @@ def apply_style(app: QApplication) -> None:
             color: {TEXT_SEC};
         }}
 
+        /* ── startup scripts +/- buttons ────────────────────────────── */
+        #scriptAddBtn {{
+            background: rgba(80,180,120,0.18);
+            border: 1px solid rgba(80,180,120,0.35);
+            border-radius: 4px;
+            color: rgba(100,210,140,0.90);
+            font-size: 14px;
+            font-weight: 600;
+        }}
+        #scriptAddBtn:hover  {{ background: rgba(80,180,120,0.30); border-color: rgba(80,180,120,0.60); color: rgb(120,230,160); }}
+        #scriptAddBtn:pressed {{ background: rgba(80,180,120,0.10); }}
+
+        #scriptRemoveBtn {{
+            background: rgba(180,80,80,0.15);
+            border: 1px solid rgba(180,80,80,0.28);
+            border-radius: 4px;
+            color: rgba(210,100,100,0.70);
+            font-size: 14px;
+            font-weight: 600;
+        }}
+        #scriptRemoveBtn:hover  {{ background: rgba(180,80,80,0.28); border-color: rgba(180,80,80,0.55); color: rgb(230,110,110); }}
+        #scriptRemoveBtn:pressed {{ background: rgba(180,80,80,0.10); }}
+        #scriptRemoveBtn:disabled {{ background: transparent; border-color: rgba(255,255,255,0.06); color: rgba(255,255,255,0.15); }}
+
+        #scriptEditBtn {{
+            background: rgba(180,150,80,0.15);
+            border: 1px solid rgba(180,150,80,0.28);
+            border-radius: 4px;
+            color: rgba(220,185,100,0.70);
+            font-size: 13px;
+            font-weight: 600;
+        }}
+        #scriptEditBtn:hover   {{ background: rgba(180,150,80,0.30); border-color: rgba(200,170,90,0.55); color: rgb(240,200,110); }}
+        #scriptEditBtn:pressed {{ background: rgba(180,150,80,0.10); }}
+        #scriptEditBtn:disabled {{ background: transparent; border-color: rgba(255,255,255,0.06); color: rgba(255,255,255,0.15); }}
+
+        #scriptOrderBtn {{
+            background: rgba(123,142,232,0.10);
+            border: 1px solid rgba(123,142,232,0.22);
+            border-radius: 4px;
+            color: rgba(123,142,232,0.55);
+            font-size: 13px;
+            font-weight: 600;
+        }}
+        #scriptOrderBtn:hover   {{ background: {ACCENT_DIM}; border-color: {ACCENT_MID}; color: {ACCENT}; }}
+        #scriptOrderBtn:pressed {{ background: rgba(123,142,232,0.08); }}
+        #scriptOrderBtn:disabled {{ background: transparent; border-color: rgba(255,255,255,0.06); color: rgba(255,255,255,0.15); }}
+
+        /* ── add script dialog notice ────────────────────────────────── */
+        #scriptNotice {{
+            font-size: 10px;
+            color: rgba(180,190,220,0.45);
+            background: transparent;
+        }}
+        #scriptArgsEdit {{
+            background: {BG_SURFACE};
+            border: 1px solid {BG_BORDER};
+            border-radius: 5px;
+            padding: 2px 8px;
+            font-size: 11px;
+            color: {TEXT_PRI};
+        }}
+        #scriptArgsEdit:focus {{ border-color: {ACCENT_MID}; background: {BG_RAISED}; }}
+
+        /* ── remove-confirm dialog labels ────────────────────────────── */
+        #confirmMainLbl {{
+            font-size: 12px; font-weight: 600;
+            color: {TEXT_PRI};
+            background: transparent;
+        }}
+        #confirmInfoLbl {{
+            font-size: 11px;
+            color: {TEXT_SEC};
+            background: transparent;
+        }}
+
         /* ── generic fallback ────────────────────────────────────────── */
         QDialog {{ background: {BG_SURFACE}; }}
         QPushButton {{
@@ -1698,15 +2699,30 @@ def apply_style(app: QApplication) -> None:
 
 
 def main() -> int:
+    # ── Windows: tell the taskbar to group under our own AppUserModelID ──────
+    # This must happen BEFORE QApplication is created.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                f"{APP_ORG}.{APP_NAME}"
+            )
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(APP_ORG)
     if ICON_PATH.exists():
-        app.setWindowIcon(QIcon(str(ICON_PATH)))
+        icon = QIcon(str(ICON_PATH))
+        app.setWindowIcon(icon)
+
     apply_style(app)
     db_manager = DatabaseManager()
     win = MainWindow(db_manager)
     win.show()
+    win.run_startup_scripts()
     code = app.exec()
     return code
 
