@@ -47,8 +47,8 @@ It features native support for Windows and Linux, with partial Wayland support.
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/asset-indexer.git
-   cd asset-indexer
+   git clone https://github.com/Ventexx/Asset-Indexer.git
+   cd Asset-Indexer
    ```
 
 2. Start the app using the provided script (recommended):
