@@ -1645,7 +1645,29 @@ class ResultsPanel(QScrollArea):
         # Keep overlay in sync
         self._overlay.setGeometry(self.viewport().rect())
 
+    def _get_expanded_keys(self) -> set[str]:
+        """Recursively collect folder_key of every currently expanded FolderSection."""
+        keys: set[str] = set()
+
+        def _collect(layout) -> None:
+            for i in range(layout.count()):
+                item = layout.itemAt(i)
+                if item is None:
+                    continue
+                w = item.widget()
+                if isinstance(w, FolderSection):
+                    if w._expanded:
+                        keys.add(w._folder_key)
+                    # Recurse into the section's body to catch child sections
+                    _collect(w._body_lay)
+
+        _collect(self._layout)
+        return keys
+
     def _populate(self, assets: list[dict]) -> None:
+        # Snapshot which folders are open so we can restore them after rebuild
+        expanded_keys = self._get_expanded_keys()
+
         while self._layout.count():
             item = self._layout.takeAt(0)
             if item is not None and (w := item.widget()):
@@ -1700,6 +1722,11 @@ class ResultsPanel(QScrollArea):
             fk = (asset.get("folder", "") or "").replace("\\", "/")
             if fk in sections:
                 sections[fk].add_card(asset, self._db)
+
+        # Re-open any folder that was expanded before the refresh
+        for fk, sec in sections.items():
+            if fk in expanded_keys:
+                sec._toggle()
 
         self._layout.addStretch()
 
@@ -2572,7 +2599,9 @@ class MainWindow(QMainWindow):
         if DEV_MODE:
             menu.addAction("⚠ Dev Mode Active - no real DB loaded").setEnabled(False)
             menu.addSeparator()
-        menu.addAction("Reload Database", self._action_reload)
+        reload_menu = menu.addMenu("Reload Database")
+        reload_menu.addAction("without Scripts", self._action_reload)
+        reload_menu.addAction("with Scripts", self._action_reload_with_scripts)
         menu.addAction("Change Database", self._action_open_db)
         menu.addAction("Add Folder", self._action_add_folder)
         menu.addAction("Startup Scripts", self._action_startup_scripts)
@@ -2590,6 +2619,39 @@ class MainWindow(QMainWindow):
             self._results.set_db(self._dev_db)  # type: ignore[arg-type]
             self._do_search()
             return
+        if self._active_db:
+            self._start_load_db(self._active_db)
+
+    def _action_reload_with_scripts(self) -> None:
+        """Run startup scripts first, then reload the active database."""
+        # ── DEV MODE: just reset the stub (no real scripts to run) ───────────
+        if DEV_MODE:
+            self._dev_db = DevDatabase()
+            self._results.set_db(self._dev_db)  # type: ignore[arg-type]
+            self._do_search()
+            return
+        scripts = _load_scripts()
+        if not scripts:
+            # No scripts configured - fall back to a plain reload
+            if self._active_db:
+                self._start_load_db(self._active_db)
+            return
+
+        self._results.show_loading(f"Executing Startup Scripts (1/{len(scripts)})")
+        self._search.setEnabled(False)
+        self._menu_btn.setEnabled(False)
+
+        runner = ScriptRunner(scripts)
+        runner.progress.connect(self._on_script_progress)
+        runner.finished.connect(self._on_reload_scripts_finished)
+        self._script_runner = runner
+        runner.start()
+
+    def _on_reload_scripts_finished(self) -> None:
+        """Called when startup scripts finish during a 'Reload with Scripts'."""
+        self._script_runner = None
+        self._search.setEnabled(True)
+        self._menu_btn.setEnabled(True)
         if self._active_db:
             self._start_load_db(self._active_db)
 
