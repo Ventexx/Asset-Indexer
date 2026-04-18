@@ -2443,7 +2443,7 @@ class MainWindow(QMainWindow):
         top_row.addWidget(self._search, 1)
 
         self._note_btn = QToolButton()
-        self._note_btn.setText("📄")
+        self._note_btn.setText("\u25a4")
         self._note_btn.setObjectName("noteBtn")
         self._note_btn.setFixedSize(26, 26)
         self._note_btn.setToolTip("Notes")
@@ -2780,8 +2780,8 @@ def _add_note_entry(name: str, value: str, category: str) -> None:
 
 
 class NoteEntryCard(QWidget):
-    CARD_W = THUMB_W
-    CARD_H = THUMB_H + 4 + NAME_H  # same total height as ThumbnailCard
+    CARD_W = THUMB_W  # 106 px
+    CARD_H = 80  # 4:3 ratio  (106 × 3/4 ≈ 80)
 
     def __init__(
         self,
@@ -2798,6 +2798,7 @@ class NoteEntryCard(QWidget):
         self._panel = panel
         self._flashing = False
         self._flash_timer: Optional[QTimer] = None
+        self._hovered = False
 
         self.setFixedSize(self.CARD_W, self.CARD_H)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -2827,6 +2828,16 @@ class NoteEntryCard(QWidget):
             self._copy_value()
         super().mousePressEvent(event)
 
+    def enterEvent(self, event) -> None:
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
     def _copy_value(self) -> None:
         QApplication.clipboard().setText(self._value)
         self._flashing = True
@@ -2848,11 +2859,24 @@ class NoteEntryCard(QWidget):
 
         super().paintEvent(event)
         if self._flashing:
+            # Clicked: subtle green fill + border
             p = QPainter(self)
             p.setRenderHint(QPainter.RenderHint.Antialiasing)
-            p.setBrush(QColor(80, 200, 120, 70))
-            pen = QPen(QColor(80, 200, 120, 180))
+            p.setBrush(QColor(80, 200, 120, 28))
+            pen = QPen(QColor(80, 200, 120, 90))
             pen.setWidth(2)
+            p.setPen(pen)
+            path = QPainterPath()
+            path.addRoundedRect(1, 1, self.CARD_W - 2, self.CARD_H - 2, 7, 7)
+            p.drawPath(path)
+            p.end()
+        elif self._hovered:
+            # Hover: very faint white/neutral tint
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setBrush(QColor(255, 255, 255, 10))
+            pen = QPen(QColor(255, 255, 255, 35))
+            pen.setWidth(1)
             p.setPen(pen)
             path = QPainterPath()
             path.addRoundedRect(1, 1, self.CARD_W - 2, self.CARD_H - 2, 7, 7)
@@ -2945,7 +2969,7 @@ class NoteSection(QWidget):
 
         self._card_widget = QWidget()
         self._card_widget.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum
         )
         self._card_grid = QGridLayout(self._card_widget)
         self._card_grid.setContentsMargins(0, 0, 0, 0)
@@ -3241,6 +3265,8 @@ class NoteWindow(QDialog):
         self.setMinimumSize(480, 360)
         self.resize(720, 540)
         self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
+        # Make the dialog background match the main app window exactly
+        self.setObjectName("noteWindowRoot")
 
         # Restore saved position/size
         prefs = _load_prefs()
@@ -3265,6 +3291,8 @@ class NoteWindow(QDialog):
         self._add_btn.setText("+")
         self._add_btn.setObjectName("noteAddBtn")
         self._add_btn.setFixedSize(26, 26)
+        # Force the text to center properly
+        self._add_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self._add_btn.clicked.connect(self._open_create_dialog)
 
         self._search = QLineEdit()
@@ -3369,26 +3397,42 @@ def apply_style(app: QApplication) -> None:
         #menuBtn:hover   {{ background: {ACCENT_DIM}; color: {ACCENT}; }}
         #menuBtn:pressed {{ background: rgba(255,255,255,0.03); }}
 
-        /* ── notes paper button ──────────────────────────────────────── */
+        /* ── notes button ────────────────────────────────────────────── */
         #noteBtn {{
-            background: transparent; border: none;
-            font-size: 15px; color: rgba(255,255,255,0.50);
-            border-radius: 5px;
+            background: {BG_SURFACE};
+            border: 1px solid {BG_BORDER};
+            border-radius: 6px;
+            color: rgba(180,190,220,0.45);
+            font-size: 14px;
+            font-weight: 400;
         }}
-        #noteBtn:hover   {{ background: {ACCENT_DIM}; color: {ACCENT}; }}
+        #noteBtn:hover   {{ background: {BG_RAISED}; border-color: rgba(255,255,255,0.13); color: rgba(210,215,240,0.80); }}
         #noteBtn:pressed {{ background: rgba(255,255,255,0.03); }}
 
         /* ── note window "+" button ──────────────────────────────────── */
         #noteAddBtn {{
             background: rgba(80,180,120,0.18);
             border: 1px solid rgba(80,180,120,0.35);
-            border-radius: 5px;
+            border-radius: 4px;
             color: rgba(100,210,140,0.90);
-            font-size: 16px;
+            font-size: 14px;
             font-weight: 700;
+            padding: 0px;
+            text-align: center;
         }}
         #noteAddBtn:hover   {{ background: rgba(80,180,120,0.30); border-color: rgba(80,180,120,0.60); color: rgb(120,230,160); }}
         #noteAddBtn:pressed {{ background: rgba(80,180,120,0.10); }}
+
+        /* ── note window background (match main app window) ─────────── */
+        #noteWindowRoot {{
+            background: {BG_BASE};
+        }}
+        #noteWindowRoot QScrollArea {{
+            background: {BG_BASE};
+        }}
+        #noteWindowRoot QWidget {{
+            background: {BG_BASE};
+        }}
 
         /* ── note entry card ─────────────────────────────────────────── */
         #noteEntry {{
