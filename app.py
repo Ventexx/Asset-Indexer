@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QTextEdit,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -964,7 +965,7 @@ class EditJsonDialog(_DraggableDialog):
         fmt = QTextCharFormat()
         fmt.setBackground(QColor(200, 170, 80, 38))
 
-        sel = QPlainTextEdit.ExtraSelection()
+        sel = QTextEdit.ExtraSelection()
         sel.cursor = line_end
         sel.format = fmt
         self._editor.setExtraSelections([sel])
