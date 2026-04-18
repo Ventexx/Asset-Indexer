@@ -2794,6 +2794,26 @@ def _save_notes(data: dict) -> None:
         pass
 
 
+_AZ_SORT_KEY = "A-Z Sort in Folder"
+
+
+def _ensure_az_sort_flag(data: dict) -> dict:
+    """Check for the 'A-Z Sort in Folder' flag at the root of the notes JSON.
+
+    - If the key is missing it is inserted at the very top (position 0) with
+      value True and the file is saved immediately.
+    - If the key already exists its value is left unchanged.
+    - Returns the (possibly updated) data dict.
+    """
+    if _AZ_SORT_KEY not in data:
+        # Insert at the very top by rebuilding the dict with the flag first
+        updated = {_AZ_SORT_KEY: True}
+        updated.update(data)
+        _save_notes(updated)
+        return updated
+    return data
+
+
 def _flatten_notes(data: dict, query: str = "", category_path: str = "") -> list[dict]:
     """Recursively flatten notes JSON into {name, value, category} dicts."""
     results: list[dict] = []
@@ -3137,7 +3157,10 @@ class NotePanel(QScrollArea):
             )
         except Exception:
             data = {}
-        self._populate(data, query, expanded_titles, scroll_value)
+        # Ensure the A-Z Sort flag exists; inserts it at the top if missing
+        data = _ensure_az_sort_flag(data)
+        az_sort = bool(data.get(_AZ_SORT_KEY, True))
+        self._populate(data, query, expanded_titles, scroll_value, az_sort)
 
     def _populate(
         self,
@@ -3145,6 +3168,7 @@ class NotePanel(QScrollArea):
         query: str = "",
         expanded_titles: set[str] | None = None,
         scroll_value: int = 0,
+        az_sort: bool = True,
     ) -> None:
         # Clear layout
         while self._layout.count():
@@ -3153,6 +3177,10 @@ class NotePanel(QScrollArea):
                 w.deleteLater()
 
         all_entries = _flatten_notes(data, query)
+
+        # Apply A-Z sort within each folder when the flag is enabled
+        if az_sort:
+            all_entries.sort(key=lambda e: (e["category"].lower(), e["name"].lower()))
 
         root_entries = [e for e in all_entries if not e["category"]]
         other_entries = [e for e in all_entries if e["category"]]
