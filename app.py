@@ -822,10 +822,13 @@ class EditJsonDialog(_DraggableDialog):
     _PREFS_KEY = "edit_json_pos"
     W, H = 500, 460
 
-    def __init__(self, asset: dict, db: Optional[Database], parent=None):
+    def __init__(
+        self, asset: dict, db: Optional[Database], parent=None, focus_key: str = ""
+    ):
         super().__init__(parent)
         self._asset = asset
         self._db = db
+        self._focus_key = focus_key
         self.setWindowTitle("Edit JSON")
         self.setModal(True)
         self.setFixedSize(self.W, self.H)
@@ -928,6 +931,53 @@ class EditJsonDialog(_DraggableDialog):
         save_btn.clicked.connect(self._save)
 
         self._restore_pos()
+
+        # Scroll to and subtly highlight the focused key after the dialog paints
+        if focus_key:
+            QTimer.singleShot(0, self._apply_focus_highlight)
+
+    def _apply_focus_highlight(self) -> None:
+        from PySide6.QtGui import QTextCharFormat, QTextCursor
+
+        doc = self._editor.document()
+        # Search for the key as it appears in pretty-printed JSON: "key":
+        search = f'"{self._focus_key}":'
+        found = doc.find(search)
+        if found.isNull():
+            return
+
+        # Extend selection to the end of that line to cover the value too
+        line_end = QTextCursor(found)
+        line_end.movePosition(
+            QTextCursor.MoveOperation.EndOfLine, QTextCursor.MoveMode.KeepAnchor
+        )
+
+        # Scroll editor to show this line, centred if possible
+        self._editor.setTextCursor(line_end)
+        self._editor.ensureCursorVisible()
+        # Move cursor to start of match so we don't leave a huge selection visible
+        plain_cursor = QTextCursor(found)
+        plain_cursor.clearSelection()
+        self._editor.setTextCursor(plain_cursor)
+
+        # Build the extra selection (amber-tinted background, no border noise)
+        fmt = QTextCharFormat()
+        fmt.setBackground(QColor(200, 170, 80, 38))
+
+        sel = QPlainTextEdit.ExtraSelection()
+        sel.cursor = line_end
+        sel.format = fmt
+        self._editor.setExtraSelections([sel])
+
+        # Clear highlight on first interaction (key press or click)
+        def _clear_highlight() -> None:
+            self._editor.setExtraSelections([])
+            try:
+                self._editor.cursorPositionChanged.disconnect(_clear_highlight)
+            except RuntimeError:
+                pass
+
+        self._editor.cursorPositionChanged.connect(_clear_highlight)
 
     def _save(self) -> None:
         new_text = self._editor.toPlainText().strip()
@@ -2911,7 +2961,7 @@ class NoteEntryCard(QWidget):
             "json_data": raw,
             "name": "notes",
         }
-        dlg = EditJsonDialog(fake, None, self)
+        dlg = EditJsonDialog(fake, None, self, focus_key=self._name)
         if dlg.exec():
             self._panel.reload()
 
@@ -3055,8 +3105,29 @@ class NotePanel(QScrollArea):
 
         self._current_query: str = ""
 
+    def _get_expanded_titles(self) -> set[str]:
+        """Recursively collect the title text of every expanded NoteSection."""
+        titles: set[str] = set()
+
+        def _collect(layout) -> None:
+            for i in range(layout.count()):
+                item = layout.itemAt(i)
+                if item is None:
+                    continue
+                w = item.widget()
+                if isinstance(w, NoteSection):
+                    if w._expanded:
+                        titles.add(w._header.text())
+                    _collect(w._body_lay)
+
+        _collect(self._layout)
+        return titles
+
     def reload(self, query: str = "") -> None:
         self._current_query = query
+        # Snapshot state before clearing so we can restore it after repopulating
+        expanded_titles = self._get_expanded_titles()
+        scroll_value = self.verticalScrollBar().value()
         try:
             data = (
                 json.loads(self._notes_file.read_text(encoding="utf-8"))
@@ -3065,9 +3136,15 @@ class NotePanel(QScrollArea):
             )
         except Exception:
             data = {}
-        self._populate(data, query)
+        self._populate(data, query, expanded_titles, scroll_value)
 
-    def _populate(self, data: dict, query: str = "") -> None:
+    def _populate(
+        self,
+        data: dict,
+        query: str = "",
+        expanded_titles: set[str] | None = None,
+        scroll_value: int = 0,
+    ) -> None:
         # Clear layout
         while self._layout.count():
             item = self._layout.takeAt(0)
@@ -3137,6 +3214,31 @@ class NotePanel(QScrollArea):
                     )
 
         self._layout.addStretch()
+
+        # Re-open any section that was expanded before the refresh
+        if expanded_titles:
+
+            def _restore(layout) -> None:
+                for i in range(layout.count()):
+                    item = layout.itemAt(i)
+                    if item is None:
+                        continue
+                    w = item.widget()
+                    if (
+                        isinstance(w, NoteSection)
+                        and w._header.text() in expanded_titles
+                    ):
+                        if not w._expanded:
+                            w._toggle()
+                        _restore(w._body_lay)
+
+            _restore(self._layout)
+
+        # Restore scroll position after layout settles
+        if scroll_value:
+            QTimer.singleShot(
+                0, lambda: self.verticalScrollBar().setValue(scroll_value)
+            )
 
 
 # ── Create Note Dialog ─────────────────────────────────────────────────────────
