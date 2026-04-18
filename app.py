@@ -60,6 +60,7 @@ APP_ORG = "AssetIndexer"
 APP_DIR = Path.home() / ".asset_indexer"
 ICON_PATH = Path(__file__).parent / "Icon.png"
 PREFS_FILE = APP_DIR / "prefs.json"
+NOTES_FILE = APP_DIR / "notes.json"
 
 # 2:3 card image area
 THUMB_W = 106
@@ -2397,6 +2398,7 @@ class MainWindow(QMainWindow):
         self._app_menu: Optional[QMenu] = None
         self._index_worker: Optional[IndexWorker] = None
         self._script_runner: Optional[ScriptRunner] = None
+        self._note_window: Optional[NoteWindow] = None
 
         # ── DEV MODE: create the in-memory stub database once here.
         #    This reference is ONLY ever used when DEV_MODE is True.
@@ -2439,6 +2441,15 @@ class MainWindow(QMainWindow):
 
         top_row.addWidget(self._menu_btn)
         top_row.addWidget(self._search, 1)
+
+        self._note_btn = QToolButton()
+        self._note_btn.setText("📄")
+        self._note_btn.setObjectName("noteBtn")
+        self._note_btn.setFixedSize(26, 26)
+        self._note_btn.setToolTip("Notes")
+        self._note_btn.clicked.connect(self._open_note_window)
+        top_row.addWidget(self._note_btn)
+
         outer.addLayout(top_row)
 
         # ── Status bar ────────────────────────────────────────────────────
@@ -2576,6 +2587,11 @@ class MainWindow(QMainWindow):
         self._set_status(f"{total} assets")
         self._index_worker = None
 
+    def _open_note_window(self) -> None:
+        if self._note_window is None:
+            self._note_window = NoteWindow(self)
+        self._note_window.show_and_reload()
+
     def _on_search_text_changed(self) -> None:
         self._search_timer.start()  # restart the 1-second debounce window
 
@@ -2705,6 +2721,593 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+# ── Notes helpers ──────────────────────────────────────────────────────────────
+
+
+def _load_notes() -> dict:
+    try:
+        if NOTES_FILE.exists():
+            return json.loads(NOTES_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def _save_notes(data: dict) -> None:
+    try:
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        NOTES_FILE.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
+def _flatten_notes(data: dict, query: str = "", category_path: str = "") -> list[dict]:
+    """Recursively flatten notes JSON into {name, value, category} dicts."""
+    results: list[dict] = []
+    for key, value in data.items():
+        if isinstance(value, str):
+            if not query or query.lower() in key.lower():
+                results.append({"name": key, "value": value, "category": category_path})
+        elif isinstance(value, dict):
+            sub = f"{category_path}/{key}" if category_path else key
+            results.extend(_flatten_notes(value, query, sub))
+    return results
+
+
+def _set_nested(data: dict, keys: list, name: str, value: str) -> None:
+    if not keys:
+        data[name] = value
+        return
+    k = keys[0]
+    if k not in data or not isinstance(data[k], dict):
+        data[k] = {}
+    _set_nested(data[k], keys[1:], name, value)
+
+
+def _add_note_entry(name: str, value: str, category: str) -> None:
+    data = _load_notes()
+    if category:
+        parts = [p for p in category.split("/") if p]
+        _set_nested(data, parts, name, value)
+    else:
+        data[name] = value
+    _save_notes(data)
+
+
+# ── Note Entry Card ────────────────────────────────────────────────────────────
+
+
+class NoteEntryCard(QWidget):
+    CARD_W = THUMB_W
+    CARD_H = THUMB_H + 4 + NAME_H  # same total height as ThumbnailCard
+
+    def __init__(
+        self,
+        name: str,
+        value: str,
+        notes_file: Path,
+        panel: "NotePanel",
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(parent)
+        self._name = name
+        self._value = value
+        self._notes_file = notes_file
+        self._panel = panel
+        self._flashing = False
+        self._flash_timer: Optional[QTimer] = None
+
+        self.setFixedSize(self.CARD_W, self.CARD_H)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setObjectName("noteEntry")
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(0)
+
+        # Equal stretch=1 gives each label exactly half the card height.
+        # AlignBottom on Name keeps it visually near the centre-line from above;
+        # AlignTop on Value keeps it near the centre-line from below.
+        name_lbl = QLabel(name)
+        name_lbl.setObjectName("noteEntryName")
+        name_lbl.setAlignment(
+            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom
+        )
+        lay.addWidget(name_lbl, 1)
+
+        val_lbl = QLabel(value)
+        val_lbl.setObjectName("noteEntryValue")
+        val_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+        lay.addWidget(val_lbl, 1)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._copy_value()
+        super().mousePressEvent(event)
+
+    def _copy_value(self) -> None:
+        QApplication.clipboard().setText(self._value)
+        self._flashing = True
+        self.update()
+        if self._flash_timer:
+            self._flash_timer.stop()
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setSingleShot(True)
+        self._flash_timer.timeout.connect(self._end_flash)
+        self._flash_timer.start(350)
+
+    def _end_flash(self) -> None:
+        self._flashing = False
+        self._flash_timer = None
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        from PySide6.QtGui import QPainterPath, QPen
+
+        super().paintEvent(event)
+        if self._flashing:
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setBrush(QColor(80, 200, 120, 70))
+            pen = QPen(QColor(80, 200, 120, 180))
+            pen.setWidth(2)
+            p.setPen(pen)
+            path = QPainterPath()
+            path.addRoundedRect(1, 1, self.CARD_W - 2, self.CARD_H - 2, 7, 7)
+            p.drawPath(path)
+            p.end()
+
+    def contextMenuEvent(self, event) -> None:
+        menu = QMenu(self)
+        menu.setObjectName("cardMenu")
+        copy_act = menu.addAction("Copy")
+        menu.addSeparator()
+        edit_act = menu.addAction("Edit Json")
+        chosen = menu.exec(event.globalPos())
+        if chosen is copy_act:
+            QApplication.clipboard().setText(self._value)
+        elif chosen is edit_act:
+            self._open_edit_json()
+
+    def _open_edit_json(self) -> None:
+        try:
+            raw = (
+                self._notes_file.read_text(encoding="utf-8")
+                if self._notes_file.exists()
+                else "{}"
+            )
+            raw = json.dumps(json.loads(raw), indent=2, ensure_ascii=False)
+        except Exception:
+            raw = "{}"
+        fake = {
+            "image_path": "",
+            "json_path": str(self._notes_file),
+            "json_data": raw,
+            "name": "notes",
+        }
+        dlg = EditJsonDialog(fake, None, self)
+        if dlg.exec():
+            self._panel.reload()
+
+
+# ── Note Section ───────────────────────────────────────────────────────────────
+
+
+class NoteSection(QWidget):
+    def __init__(
+        self,
+        title: str,
+        depth: int = 0,
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(parent)
+        self._expanded = False
+        self._depth = depth
+        self._child_sections: list["NoteSection"] = []
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # ── Header ──────────────────────────────────────────────────────
+        header_container = QWidget()
+        header_container.setObjectName("sectionHeaderWrap")
+        hc_lay = QHBoxLayout(header_container)
+        indent = depth * 14
+        hc_lay.setContentsMargins(indent, 0, 0, 0)
+        hc_lay.setSpacing(4)
+
+        self._header = QToolButton()
+        self._header.setObjectName("sectionHeader")
+        self._header.setCheckable(False)
+        self._header.setArrowType(Qt.ArrowType.RightArrow)
+        self._header.setText(title)
+        self._header.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed
+        )
+        self._header.setFixedHeight(24 if depth == 0 else 22)
+        self._header.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._header.clicked.connect(self._toggle)
+        # No context menu on note folder headers
+
+        hc_lay.addWidget(self._header)
+        hc_lay.addStretch()
+        outer.addWidget(header_container)
+
+        # ── Body ─────────────────────────────────────────────────────────
+        self._body = QWidget()
+        self._body.setObjectName("sectionBody")
+        self._body_lay = QVBoxLayout(self._body)
+        self._body_lay.setContentsMargins(indent + 8, 4, 4, 6)
+        self._body_lay.setSpacing(2)
+
+        self._card_widget = QWidget()
+        self._card_widget.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        self._card_grid = QGridLayout(self._card_widget)
+        self._card_grid.setContentsMargins(0, 0, 0, 0)
+        self._card_grid.setSpacing(6)
+        self._card_grid.setAlignment(
+            Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft
+        )
+        self._body_lay.addWidget(self._card_widget)
+
+        self._body.setVisible(False)
+        outer.addWidget(self._body)
+
+        self._cards: list[NoteEntryCard] = []
+        self._current_cols: int = COLS
+
+    def add_card(
+        self, name: str, value: str, notes_file: Path, panel: "NotePanel"
+    ) -> None:
+        card = NoteEntryCard(name, value, notes_file, panel)
+        i = len(self._cards)
+        self._cards.append(card)
+        self._card_grid.addWidget(card, i // COLS, i % COLS)
+
+    def add_child_section(self, sec: "NoteSection") -> None:
+        self._child_sections.append(sec)
+        self._body_lay.addWidget(sec)
+
+    def _relayout_cards(self) -> None:
+        avail_w = self._card_widget.width()
+        if avail_w < NoteEntryCard.CARD_W:
+            return
+        cols = max(1, avail_w // (NoteEntryCard.CARD_W + 6))
+        if cols == self._current_cols:
+            return
+        self._current_cols = cols
+        while self._card_grid.count():
+            self._card_grid.takeAt(0)
+        for i, card in enumerate(self._cards):
+            self._card_grid.addWidget(card, i // cols, i % cols)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._expanded and self._cards:
+            self._relayout_cards()
+
+    def _toggle(self) -> None:
+        self._expanded = not self._expanded
+        self._body.setVisible(self._expanded)
+        self._header.setArrowType(
+            Qt.ArrowType.DownArrow if self._expanded else Qt.ArrowType.RightArrow
+        )
+        if self._expanded and self._cards:
+            self._current_cols = 0
+            QTimer.singleShot(0, self._relayout_cards)
+
+
+# ── Note Panel ─────────────────────────────────────────────────────────────────
+
+
+class NotePanel(QScrollArea):
+    def __init__(self, notes_file: Path, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._notes_file = notes_file
+        self.setObjectName("resultsPanel")
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        self._content = QWidget()
+        self._layout = QVBoxLayout(self._content)
+        self._layout.setContentsMargins(6, 6, 6, 6)
+        self._layout.setSpacing(1)
+        self._layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.setWidget(self._content)
+
+        self._current_query: str = ""
+
+    def reload(self, query: str = "") -> None:
+        self._current_query = query
+        try:
+            data = (
+                json.loads(self._notes_file.read_text(encoding="utf-8"))
+                if self._notes_file.exists()
+                else {}
+            )
+        except Exception:
+            data = {}
+        self._populate(data, query)
+
+    def _populate(self, data: dict, query: str = "") -> None:
+        # Clear layout
+        while self._layout.count():
+            item = self._layout.takeAt(0)
+            if item is not None and (w := item.widget()):
+                w.deleteLater()
+
+        all_entries = _flatten_notes(data, query)
+
+        root_entries = [e for e in all_entries if not e["category"]]
+        other_entries = [e for e in all_entries if e["category"]]
+
+        # ── Root entries (no category) shown at top as flat card grid ────
+        if root_entries:
+            root_widget = QWidget()
+            root_grid = QGridLayout(root_widget)
+            root_grid.setContentsMargins(0, 2, 0, 6)
+            root_grid.setSpacing(6)
+            root_grid.setAlignment(
+                Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft
+            )
+            for i, entry in enumerate(root_entries):
+                card = NoteEntryCard(
+                    entry["name"], entry["value"], self._notes_file, self
+                )
+                root_grid.addWidget(card, i // COLS, i % COLS)
+            self._layout.addWidget(root_widget)
+
+        # ── Folder sections for categorised entries ───────────────────────
+        if other_entries:
+            all_folder_paths: set[str] = set()
+            for e in other_entries:
+                parts = e["category"].split("/")
+                for depth in range(1, len(parts) + 1):
+                    all_folder_paths.add("/".join(parts[:depth]))
+
+            folder_list = sorted(all_folder_paths)
+            sections: dict[str, NoteSection] = {}
+
+            for folder_path in folder_list:
+                parts = folder_path.split("/")
+                depth = len(parts)
+                title = parts[-1]
+                sec = NoteSection(title, depth=depth - 1)
+                sections[folder_path] = sec
+
+                if depth == 1:
+                    self._layout.addWidget(sec)
+                else:
+                    parent_path = "/".join(parts[:-1])
+                    if parent_path in sections:
+                        sections[parent_path].add_child_section(sec)
+                    else:
+                        self._layout.addWidget(sec)
+
+            for entry in other_entries:
+                cat = entry["category"]
+                if cat in sections:
+                    sections[cat].add_card(
+                        entry["name"], entry["value"], self._notes_file, self
+                    )
+
+        self._layout.addStretch()
+
+
+# ── Create Note Dialog ─────────────────────────────────────────────────────────
+
+
+class CreateNoteDialog(_DraggableDialog):
+    _PREFS_KEY = "create_note_pos"
+    W, H = 310, 230
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setModal(True)
+        self.setFixedSize(self.W, self.H)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        shadow_frame = QFrame(self)
+        shadow_frame.setObjectName("dialogShadow")
+        shadow_frame.setGeometry(4, 4, self.W - 4, self.H - 4)
+
+        frame = QFrame(self)
+        frame.setObjectName("editDialogFrame")
+        frame.setGeometry(0, 0, self.W - 4, self.H - 4)
+
+        lay = QVBoxLayout(frame)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        # ── Header ────────────────────────────────────────────────────────
+        header = QWidget()
+        header.setObjectName("editDialogHeader")
+        header.setFixedHeight(26)
+        h_lay = QHBoxLayout(header)
+        h_lay.setContentsMargins(14, 0, 10, 0)
+        h_lay.setSpacing(8)
+
+        dot = QWidget()
+        dot.setObjectName("editDialogDot")
+        dot.setFixedSize(6, 6)
+
+        title_lbl = QLabel("Create New...")
+        title_lbl.setObjectName("editDialogTitle")
+
+        close_btn = QToolButton()
+        close_btn.setText("✕")
+        close_btn.setObjectName("dbDialogClose")
+        close_btn.setFixedSize(18, 18)
+        close_btn.clicked.connect(self.reject)
+
+        h_lay.addWidget(dot)
+        h_lay.addWidget(title_lbl)
+        h_lay.addStretch()
+        h_lay.addWidget(close_btn)
+        lay.addWidget(header)
+
+        sep = QFrame()
+        sep.setObjectName("dbDialogSep")
+        sep.setFrameShape(QFrame.Shape.HLine)
+        lay.addWidget(sep)
+
+        # ── Body: three fields ────────────────────────────────────────────
+        body = QWidget()
+        b_lay = QVBoxLayout(body)
+        b_lay.setContentsMargins(14, 10, 14, 8)
+        b_lay.setSpacing(8)
+
+        self._name_edit = QLineEdit()
+        self._name_edit.setObjectName("scriptArgsEdit")
+        self._name_edit.setPlaceholderText("Name  (required)")
+        self._name_edit.setFixedHeight(24)
+        b_lay.addWidget(self._name_edit)
+
+        self._value_edit = QLineEdit()
+        self._value_edit.setObjectName("scriptArgsEdit")
+        self._value_edit.setPlaceholderText("Value  (required)")
+        self._value_edit.setFixedHeight(24)
+        b_lay.addWidget(self._value_edit)
+
+        self._cat_edit = QLineEdit()
+        self._cat_edit.setObjectName("scriptArgsEdit")
+        self._cat_edit.setPlaceholderText("Category  (optional, e.g. Pet/Dog)")
+        self._cat_edit.setFixedHeight(24)
+        b_lay.addWidget(self._cat_edit)
+
+        b_lay.addStretch()
+        lay.addWidget(body, 1)
+
+        sep2 = QFrame()
+        sep2.setObjectName("dbDialogSep")
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        lay.addWidget(sep2)
+
+        # ── Footer ────────────────────────────────────────────────────────
+        footer = QWidget()
+        footer.setObjectName("editDialogFooter")
+        f_lay = QHBoxLayout(footer)
+        f_lay.setContentsMargins(10, 5, 10, 6)
+        f_lay.setSpacing(0)
+
+        save_btn = QPushButton("Save")
+        save_btn.setObjectName("editSaveBtn")
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setObjectName("editCancelBtn")
+
+        f_lay.addWidget(save_btn)
+        f_lay.addStretch()
+        f_lay.addWidget(cancel_btn)
+        lay.addWidget(footer)
+
+        save_btn.clicked.connect(self._accept)
+        cancel_btn.clicked.connect(self.reject)
+        self._name_edit.returnPressed.connect(self._accept)
+        self._value_edit.returnPressed.connect(self._accept)
+        self._cat_edit.returnPressed.connect(self._accept)
+
+        self._restore_pos()
+        QTimer.singleShot(0, self._name_edit.setFocus)
+
+    def _accept(self) -> None:
+        name = self._name_edit.text().strip()
+        value = self._value_edit.text().strip()
+        if not name or not value:
+            QMessageBox.warning(self, APP_NAME, "Name and Value are required.")
+            return
+        category = self._cat_edit.text().strip()
+        _add_note_entry(name, value, category)
+        self.accept()
+
+
+# ── Note Window ────────────────────────────────────────────────────────────────
+
+
+class NoteWindow(QDialog):
+    """Floating, non-modal notes window with its own search + canvas."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Notes")
+        self.setModal(False)
+        self.setMinimumSize(480, 360)
+        self.resize(720, 540)
+        self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
+
+        # Restore saved position/size
+        prefs = _load_prefs()
+        pos = prefs.get("note_window_pos")
+        if pos and len(pos) == 2:
+            self.move(pos[0], pos[1])
+
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(600)
+        self._search_timer.timeout.connect(self._do_search)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(4)
+
+        # ── Top row: "+" button + search bar ─────────────────────────────
+        top_row = QHBoxLayout()
+        top_row.setSpacing(6)
+
+        self._add_btn = QToolButton()
+        self._add_btn.setText("+")
+        self._add_btn.setObjectName("noteAddBtn")
+        self._add_btn.setFixedSize(26, 26)
+        self._add_btn.clicked.connect(self._open_create_dialog)
+
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search notes by name...")
+        self._search.setFixedHeight(26)
+        self._search.textChanged.connect(self._on_search_changed)
+
+        top_row.addWidget(self._add_btn)
+        top_row.addWidget(self._search, 1)
+        lay.addLayout(top_row)
+
+        # ── Canvas ────────────────────────────────────────────────────────
+        self._panel = NotePanel(NOTES_FILE)
+        self._panel.setMinimumHeight(280)
+        lay.addWidget(self._panel, 1)
+
+    def closeEvent(self, event) -> None:
+        prefs = _load_prefs()
+        prefs["note_window_pos"] = [self.x(), self.y()]
+        _save_prefs(prefs)
+        super().closeEvent(event)
+
+    def show_and_reload(self) -> None:
+        """Show (or raise) the window and reload note data."""
+        self._panel.reload(self._search.text().strip())
+        if not self.isVisible():
+            self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _open_create_dialog(self) -> None:
+        dlg = CreateNoteDialog(self)
+        if dlg.exec():
+            self._panel.reload(self._search.text().strip())
+
+    def _on_search_changed(self) -> None:
+        self._search_timer.start()
+
+    def _do_search(self) -> None:
+        self._search_timer.stop()
+        self._panel.reload(self._search.text().strip())
+
+
 # ── Styling ────────────────────────────────────────────────────────────────────
 
 
@@ -2765,6 +3368,45 @@ def apply_style(app: QApplication) -> None:
         }}
         #menuBtn:hover   {{ background: {ACCENT_DIM}; color: {ACCENT}; }}
         #menuBtn:pressed {{ background: rgba(255,255,255,0.03); }}
+
+        /* ── notes paper button ──────────────────────────────────────── */
+        #noteBtn {{
+            background: transparent; border: none;
+            font-size: 15px; color: rgba(255,255,255,0.50);
+            border-radius: 5px;
+        }}
+        #noteBtn:hover   {{ background: {ACCENT_DIM}; color: {ACCENT}; }}
+        #noteBtn:pressed {{ background: rgba(255,255,255,0.03); }}
+
+        /* ── note window "+" button ──────────────────────────────────── */
+        #noteAddBtn {{
+            background: rgba(80,180,120,0.18);
+            border: 1px solid rgba(80,180,120,0.35);
+            border-radius: 5px;
+            color: rgba(100,210,140,0.90);
+            font-size: 16px;
+            font-weight: 700;
+        }}
+        #noteAddBtn:hover   {{ background: rgba(80,180,120,0.30); border-color: rgba(80,180,120,0.60); color: rgb(120,230,160); }}
+        #noteAddBtn:pressed {{ background: rgba(80,180,120,0.10); }}
+
+        /* ── note entry card ─────────────────────────────────────────── */
+        #noteEntry {{
+            background: {BG_SURFACE};
+            border: 1px solid {BG_BORDER};
+            border-radius: 7px;
+        }}
+        #noteEntryName {{
+            font-size: 11px;
+            font-weight: 700;
+            color: {TEXT_PRI};
+            background: transparent;
+        }}
+        #noteEntryValue {{
+            font-size: 9px;
+            color: {TEXT_SEC};
+            background: transparent;
+        }}
 
         /* ── search ──────────────────────────────────────────────────── */
         QLineEdit {{
