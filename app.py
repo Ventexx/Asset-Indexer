@@ -2443,7 +2443,7 @@ class MainWindow(QMainWindow):
         top_row.addWidget(self._search, 1)
 
         self._note_btn = QToolButton()
-        self._note_btn.setText("\u25a4")
+        self._note_btn.setText("\uf249")
         self._note_btn.setObjectName("noteBtn")
         self._note_btn.setFixedSize(26, 26)
         self._note_btn.setToolTip("Notes")
