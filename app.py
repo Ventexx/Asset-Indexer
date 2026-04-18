@@ -2991,7 +2991,10 @@ class NoteSection(QWidget):
         card = NoteEntryCard(name, value, notes_file, panel)
         i = len(self._cards)
         self._cards.append(card)
-        self._card_grid.addWidget(card, i // COLS, i % COLS)
+        row = i // COLS
+        self._card_grid.addWidget(card, row, i % COLS)
+        self._card_grid.setRowMinimumHeight(row, 0)
+        self._card_grid.setRowStretch(row, 0)
 
     def add_child_section(self, sec: "NoteSection") -> None:
         self._child_sections.append(sec)
@@ -3009,6 +3012,11 @@ class NoteSection(QWidget):
             self._card_grid.takeAt(0)
         for i, card in enumerate(self._cards):
             self._card_grid.addWidget(card, i // cols, i % cols)
+        # Force each row to only be as tall as the card — no extra expansion
+        num_rows = (len(self._cards) + cols - 1) // cols
+        for r in range(num_rows):
+            self._card_grid.setRowMinimumHeight(r, 0)
+            self._card_grid.setRowStretch(r, 0)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -3074,6 +3082,9 @@ class NotePanel(QScrollArea):
         # ── Root entries (no category) shown at top as flat card grid ────
         if root_entries:
             root_widget = QWidget()
+            root_widget.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum
+            )
             root_grid = QGridLayout(root_widget)
             root_grid.setContentsMargins(0, 2, 0, 6)
             root_grid.setSpacing(6)
@@ -3085,6 +3096,10 @@ class NotePanel(QScrollArea):
                     entry["name"], entry["value"], self._notes_file, self
                 )
                 root_grid.addWidget(card, i // COLS, i % COLS)
+            num_rows = (len(root_entries) + COLS - 1) // COLS
+            for r in range(num_rows):
+                root_grid.setRowMinimumHeight(r, 0)
+                root_grid.setRowStretch(r, 0)
             self._layout.addWidget(root_widget)
 
         # ── Folder sections for categorised entries ───────────────────────
