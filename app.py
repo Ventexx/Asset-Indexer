@@ -953,9 +953,9 @@ class EditJsonDialog(_DraggableDialog):
             QTextCursor.MoveOperation.EndOfLine, QTextCursor.MoveMode.KeepAnchor
         )
 
-        # Scroll editor to show this line, centred if possible
+        # Scroll editor to show this line, centred in the viewport
         self._editor.setTextCursor(line_end)
-        self._editor.ensureCursorVisible()
+        self._editor.centerCursor()
         # Move cursor to start of match so we don't leave a huge selection visible
         plain_cursor = QTextCursor(found)
         plain_cursor.clearSelection()
