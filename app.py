@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QToolButton,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 
 # ── Dev Mode ───────────────────────────────────────────────────────────────────
@@ -1254,7 +1255,24 @@ class ThumbnailCard(QWidget):
         except Exception:
             data = {}
 
-        for key, value in data.items():
+        # ── LoRA handling ─────────────────────────────────────────────────
+        # Only show a small "LORA" badge when lora=true.
+        # Nothing is shown for lora=false or when the key is absent.
+        # The "lora" key is always excluded from the copy actions.
+        if data.get("lora") is True:
+            lora_lbl = QLabel("LORA")
+            lora_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lora_lbl.setStyleSheet(
+                "color: rgba(255,200,80,0.85); font-size: 8px; font-weight: 700;"
+                " letter-spacing: 1px; padding: 2px 0px 1px 0px; background: transparent;"
+            )
+            wa = QWidgetAction(menu)
+            wa.setDefaultWidget(lora_lbl)
+            menu.addAction(wa)
+
+        # Copy actions - always shown, but "lora" key is excluded
+        copy_data = {k: v for k, v in data.items() if k != "lora"}
+        for key, value in copy_data.items():
             text = str(value).strip()
             if not text:
                 continue
@@ -1262,7 +1280,7 @@ class ThumbnailCard(QWidget):
             act = menu.addAction(label)
             act.setData(text)
 
-        if data:
+        if copy_data:
             menu.addSeparator()
 
         add_tag_act = menu.addAction("Add Tag")
