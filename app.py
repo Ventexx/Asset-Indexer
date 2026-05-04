@@ -65,6 +65,11 @@ ICON_PATH = Path(__file__).parent / "Icon.png"
 PREFS_FILE = APP_DIR / "prefs.json"
 NOTES_FILE = APP_DIR / "notes.json"
 
+# ── Session-only window positions ─────────────────────────────────────────────
+# Positions are stored here (in memory) when a dialog is dragged or closed.
+# They are NEVER written to disk, so every app restart centres dialogs fresh.
+_SESSION_POS: dict[str, list[int]] = {}
+
 # 2:3 card image area
 THUMB_W = 106
 THUMB_H = 159
@@ -1019,7 +1024,13 @@ class IndexWorker(QThread):
 
 
 class _DraggableDialog(QDialog):
-    """Base for frameless dialogs that are draggable and remember position."""
+    """Base for frameless dialogs that are draggable and remember position.
+
+    Position memory is session-only (stored in _SESSION_POS, never on disk).
+    On the first open after each app start the dialog centres itself over its
+    parent window; after the user drags it, the new position is remembered for
+    the rest of that session.
+    """
 
     _PREFS_KEY: str = ""  # subclasses set this
 
@@ -1027,22 +1038,33 @@ class _DraggableDialog(QDialog):
         super().__init__(parent)
         self._drag_pos: Optional[QPoint] = None
 
+    def _center_on_parent(self) -> None:
+        """Move this dialog to the centre of its parent (or screen if no parent)."""
+        parent = self.parent()
+        if parent is not None:
+            pw = parent.window()
+            center = pw.frameGeometry().center()
+        else:
+            center = QApplication.primaryScreen().availableGeometry().center()
+        fg = self.frameGeometry()
+        fg.moveCenter(center)
+        self.move(fg.topLeft())
+
     def _restore_pos(self) -> None:
+        """Position from session memory, or centre on parent if not yet moved."""
         key = self._PREFS_KEY
-        if not key:
-            return
-        prefs = _load_prefs()
-        pos = prefs.get(key)
+        pos = _SESSION_POS.get(key) if key else None
         if pos and len(pos) == 2:
             self.move(pos[0], pos[1])
+        else:
+            self._center_on_parent()
 
     def _save_pos(self) -> None:
+        """Remember position in session memory (never written to disk)."""
         key = self._PREFS_KEY
         if not key:
             return
-        prefs = _load_prefs()
-        prefs[key] = [self.x(), self.y()]
-        _save_prefs(prefs)
+        _SESSION_POS[key] = [self.x(), self.y()]
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -3835,9 +3857,9 @@ class NoteWindow(QDialog):
         # Make the dialog background match the main app window exactly
         self.setObjectName("noteWindowRoot")
 
-        # Restore saved position/size
-        prefs = _load_prefs()
-        pos = prefs.get("note_window_pos")
+        # Restore session-only position (resets to centre on each app start).
+        # If no session position exists, showEvent will centre the window once shown.
+        pos = _SESSION_POS.get("note_window_pos")
         if pos and len(pos) == 2:
             self.move(pos[0], pos[1])
 
@@ -3877,10 +3899,25 @@ class NoteWindow(QDialog):
         lay.addWidget(self._panel, 1)
 
     def closeEvent(self, event) -> None:
-        prefs = _load_prefs()
-        prefs["note_window_pos"] = [self.x(), self.y()]
-        _save_prefs(prefs)
+        _SESSION_POS["note_window_pos"] = [self.x(), self.y()]
         super().closeEvent(event)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        # Centre over the parent on the very first show of each session.
+        # If the user already moved the window this session, _SESSION_POS will
+        # have been set in closeEvent and the __init__ move() will have placed
+        # it correctly, so we only centre when no session position exists.
+        if "note_window_pos" not in _SESSION_POS:
+            parent = self.parent()
+            if parent is not None:
+                pw = parent.window()
+                center = pw.frameGeometry().center()
+            else:
+                center = QApplication.primaryScreen().availableGeometry().center()
+            fg = self.frameGeometry()
+            fg.moveCenter(center)
+            self.move(fg.topLeft())
 
     def show_and_reload(self) -> None:
         """Show (or raise) the window and reload note data."""
