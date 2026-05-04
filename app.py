@@ -13,8 +13,8 @@ from typing import Optional
 # import os
 # os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
-from PySide6.QtCore import QMimeData, QPoint, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDrag, QIcon, QPainter, QPalette, QPixmap
+from PySide6.QtCore import QEvent, QMimeData, QPoint, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QCursor, QDrag, QIcon, QPainter, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -1957,6 +1957,48 @@ class ResultsPanel(QScrollArea):
         # Loading overlay (child of the viewport so it covers the scroll area)
         self._overlay = LoadingOverlay(self.viewport())
 
+        # ── Middle-mouse autopan ──────────────────────────────────────────
+        # Attributes must all exist before installEventFilter, which can
+        # immediately trigger eventFilter calls during initialisation.
+        self._autopan_active: bool = False
+        self._autopan_origin: QPoint = QPoint()
+        self._autopan_timer: QTimer = QTimer(self)
+        self._autopan_timer.setInterval(16)  # ~60 fps
+        self._autopan_timer.timeout.connect(self._autopan_tick)
+        self.viewport().setMouseTracking(True)
+        self.viewport().installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self.viewport():
+            t = event.type()
+            if t == t.MouseButtonPress and event.button() == Qt.MouseButton.MiddleButton:
+                self._autopan_active = True
+                self._autopan_origin = event.position().toPoint()
+                self.viewport().setCursor(Qt.CursorShape.SizeVerCursor)
+                self._autopan_timer.start()
+                return True
+            if t == t.MouseButtonRelease and event.button() == Qt.MouseButton.MiddleButton:
+                self._stop_autopan()
+                return True
+        return super().eventFilter(obj, event)
+
+    def _autopan_tick(self) -> None:
+        if not self._autopan_active:
+            return
+        cursor_pos = self.viewport().mapFromGlobal(self.viewport().cursor().pos())
+        delta_y = cursor_pos.y() - self._autopan_origin.y()
+        # Dead zone of ±8 px, then scale speed with distance
+        if abs(delta_y) < 8:
+            return
+        speed = int((delta_y - (8 if delta_y > 0 else -8)) * 0.4)
+        bar = self.verticalScrollBar()
+        bar.setValue(bar.value() + speed)
+
+    def _stop_autopan(self) -> None:
+        self._autopan_active = False
+        self._autopan_timer.stop()
+        self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+
     def set_db(
         self, db: Optional[Database], root_folder: Optional[Path] = None
     ) -> None:
@@ -1964,15 +2006,26 @@ class ResultsPanel(QScrollArea):
         self._root_folder = root_folder
         self.refresh()
 
-    def refresh(self, query: str = "") -> None:
+    def refresh(
+        self,
+        query: str = "",
+        restore_keys: Optional[set[str]] = None,
+        restore_scroll: int = 0,
+    ) -> None:
         assets = self._db.search(query) if self._db else []
         if assets:
             # Show a message BEFORE the UI freezes while rendering all thumbnails.
             # processEvents() flushes it to screen before the heavy _populate() call.
             self.show_loading("Rendering images... this may take a moment")
             QApplication.processEvents()
-        self._populate(assets)
+        self._populate(assets, restore_keys=restore_keys)
         self.hide_loading()
+        if restore_scroll:
+            # Two deferred ticks: first lets folder bodies become visible,
+            # second lets the scroll area recalculate its full content height.
+            QTimer.singleShot(0, lambda: QTimer.singleShot(
+                0, lambda: self.verticalScrollBar().setValue(restore_scroll)
+            ))
 
     def show_loading(self, msg: str = "Loading...") -> None:
         self._overlay.set_message(msg)
@@ -2009,9 +2062,26 @@ class ResultsPanel(QScrollArea):
         _collect(self._layout)
         return keys
 
-    def _populate(self, assets: list[dict]) -> None:
-        # Snapshot which folders are open so we can restore them after rebuild
-        expanded_keys = self._get_expanded_keys()
+    def restore_expanded(self, keys: set[str]) -> None:
+        """Re-open every FolderSection whose folder_key is in `keys`."""
+        def _apply(layout) -> None:
+            for i in range(layout.count()):
+                item = layout.itemAt(i)
+                if item is None:
+                    continue
+                w = item.widget()
+                if isinstance(w, FolderSection):
+                    if w._folder_key in keys and not w._expanded:
+                        w._toggle()
+                    _apply(w._body_lay)
+
+        _apply(self._layout)
+
+    def _populate(self, assets: list[dict], restore_keys: Optional[set[str]] = None) -> None:
+        # If no explicit keys provided, snapshot what's currently open so a
+        # normal refresh (JSON edit, delete, etc.) preserves expanded state.
+        if restore_keys is None:
+            restore_keys = self._get_expanded_keys()
 
         while self._layout.count():
             item = self._layout.takeAt(0)
@@ -2070,7 +2140,7 @@ class ResultsPanel(QScrollArea):
 
         # Re-open any folder that was expanded before the refresh
         for fk, sec in sections.items():
-            if fk in expanded_keys:
+            if fk in restore_keys:
                 sec._toggle()
 
         self._layout.addStretch()
@@ -2741,6 +2811,8 @@ class MainWindow(QMainWindow):
         self._active_db = ""
         self._app_menu: Optional[QMenu] = None
         self._index_worker: Optional[IndexWorker] = None
+        self._pre_search_expanded: Optional[set[str]] = None
+        self._pre_search_scroll: int = 0
         self._script_runner: Optional[ScriptRunner] = None
         self._note_window: Optional[NoteWindow] = None
 
@@ -2974,11 +3046,30 @@ class MainWindow(QMainWindow):
         self._note_window.show_and_reload()
 
     def _on_search_text_changed(self) -> None:
+        text = self._search.text().strip()
+
+        # Snapshot expanded folders + scroll position the moment the user starts a new search
+        if text and self._pre_search_expanded is None:
+            self._pre_search_expanded = self._results._get_expanded_keys()
+            self._pre_search_scroll = self._results.verticalScrollBar().value()
+
         self._search_timer.start()  # restart the 1-second debounce window
 
     def _do_search(self) -> None:
         self._search_timer.stop()
-        self._results.refresh(self._search.text().strip())
+        text = self._search.text().strip()
+
+        if not text and self._pre_search_expanded is not None:
+            # Search cleared → restore exactly where the user was
+            self._results.refresh(
+                "",
+                restore_keys=self._pre_search_expanded,
+                restore_scroll=self._pre_search_scroll,
+            )
+            self._pre_search_expanded = None
+            self._pre_search_scroll = 0
+        else:
+            self._results.refresh(text)
 
     def _set_status(self, msg: str) -> None:
         self._status_lbl.setText(msg)
