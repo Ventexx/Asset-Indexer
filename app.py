@@ -65,11 +65,6 @@ ICON_PATH = Path(__file__).parent / "Icon.png"
 PREFS_FILE = APP_DIR / "prefs.json"
 NOTES_FILE = APP_DIR / "notes.json"
 
-# ── Session-only window positions ─────────────────────────────────────────────
-# Positions are stored here (in memory) when a dialog is dragged or closed.
-# They are NEVER written to disk, so every app restart centres dialogs fresh.
-_SESSION_POS: dict[str, list[int]] = {}
-
 # 2:3 card image area
 THUMB_W = 106
 THUMB_H = 159
@@ -1024,13 +1019,7 @@ class IndexWorker(QThread):
 
 
 class _DraggableDialog(QDialog):
-    """Base for frameless dialogs that are draggable and remember position.
-
-    Position memory is session-only (stored in _SESSION_POS, never on disk).
-    On the first open after each app start the dialog centres itself over its
-    parent window; after the user drags it, the new position is remembered for
-    the rest of that session.
-    """
+    """Base for frameless dialogs that are draggable and remember position."""
 
     _PREFS_KEY: str = ""  # subclasses set this
 
@@ -1038,33 +1027,22 @@ class _DraggableDialog(QDialog):
         super().__init__(parent)
         self._drag_pos: Optional[QPoint] = None
 
-    def _center_on_parent(self) -> None:
-        """Move this dialog to the centre of its parent (or screen if no parent)."""
-        parent = self.parent()
-        if parent is not None:
-            pw = parent.window()
-            center = pw.frameGeometry().center()
-        else:
-            center = QApplication.primaryScreen().availableGeometry().center()
-        fg = self.frameGeometry()
-        fg.moveCenter(center)
-        self.move(fg.topLeft())
-
     def _restore_pos(self) -> None:
-        """Position from session memory, or centre on parent if not yet moved."""
-        key = self._PREFS_KEY
-        pos = _SESSION_POS.get(key) if key else None
-        if pos and len(pos) == 2:
-            self.move(pos[0], pos[1])
-        else:
-            self._center_on_parent()
-
-    def _save_pos(self) -> None:
-        """Remember position in session memory (never written to disk)."""
         key = self._PREFS_KEY
         if not key:
             return
-        _SESSION_POS[key] = [self.x(), self.y()]
+        prefs = _load_prefs()
+        pos = prefs.get(key)
+        if pos and len(pos) == 2:
+            self.move(pos[0], pos[1])
+
+    def _save_pos(self) -> None:
+        key = self._PREFS_KEY
+        if not key:
+            return
+        prefs = _load_prefs()
+        prefs[key] = [self.x(), self.y()]
+        _save_prefs(prefs)
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -1383,7 +1361,8 @@ class AddTagDialog(_DraggableDialog):
 
 class ThumbnailCard(QWidget):
     deleted = Signal(str)
-    edited = Signal(str)  # emitted after a successful JSON edit (image_path)
+    edited = Signal(str)       # emitted after a successful JSON edit (image_path)
+    view_requested = Signal(object)  # emitted on left-click: passes self
 
     CARD_W = THUMB_W
     CARD_H = THUMB_H + 4 + NAME_H
@@ -1484,6 +1463,15 @@ class ThumbnailCard(QWidget):
                 self._start_drag()
                 return
         super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._drag_start_pos is not None:
+            # Released without triggering a drag → open viewer
+            self._drag_start_pos = None
+            image_path = self.asset.get("image_path", "")
+            if image_path:
+                self.view_requested.emit(self)
+        super().mouseReleaseEvent(event)
 
     def _start_drag(self) -> None:
         image_path = self.asset.get("image_path", "")
@@ -1651,7 +1639,8 @@ class ThumbnailCard(QWidget):
 class FolderSection(QWidget):
     card_deleted = Signal(str)
     card_edited = Signal(str)
-    folder_tagged = Signal(str)  # emitted when a folder tag is written (folder_key)
+    folder_tagged = Signal(str)   # emitted when a folder tag is written (folder_key)
+    card_view_requested = Signal(object, list)  # (card, ordered_cards_in_folder)
 
     def __init__(
         self,
@@ -1751,11 +1740,16 @@ class FolderSection(QWidget):
         card = ThumbnailCard(asset, db or self._db_ref)
         card.deleted.connect(self.card_deleted)
         card.edited.connect(self.card_edited)
+        card.view_requested.connect(self._on_card_view_requested)
         # Add to grid immediately using a reasonable default col count;
         # actual layout is corrected when the section is expanded/shown.
         i = len(self._cards)
         self._cards.append(card)
         self._card_grid.addWidget(card, i // COLS, i % COLS)
+
+    def _on_card_view_requested(self, card: ThumbnailCard) -> None:
+        """Relay view request with the ordered card list of this folder."""
+        self.card_view_requested.emit(card, list(self._cards))
 
     def _relayout_cards(self) -> None:
         """Re-flow cards into the grid based on current available width."""
@@ -1787,6 +1781,7 @@ class FolderSection(QWidget):
         sec.card_deleted.connect(self.card_deleted)
         sec.card_edited.connect(self.card_edited)
         sec.folder_tagged.connect(self.folder_tagged)
+        sec.card_view_requested.connect(self.card_view_requested)
         self._body_lay.addWidget(sec)
 
     def has_cards(self) -> bool:
@@ -1959,6 +1954,8 @@ class FolderSection(QWidget):
 
 
 class ResultsPanel(QScrollArea):
+    card_view_requested = Signal(object, list)  # (card, ordered_cards_in_folder)
+
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.setObjectName("resultsPanel")
@@ -2144,6 +2141,7 @@ class ResultsPanel(QScrollArea):
             sec.card_deleted.connect(self._on_card_deleted)
             sec.card_edited.connect(self._on_card_edited)
             sec.folder_tagged.connect(self._on_folder_tagged)
+            sec.card_view_requested.connect(self.card_view_requested)
             sections[fk] = sec
 
             if depth <= 1:
@@ -2823,6 +2821,235 @@ class StartupScriptsDialog(_DraggableDialog):
             self._list.setCurrentRow(row + 1)
 
 
+
+# ── Image Viewer Overlay ───────────────────────────────────────────────────────
+
+
+class ImgViewerOverlay(QWidget):
+    """
+    Full-size overlay that dims the app and shows one image at a time.
+
+    • Opens centred in the central widget on left-click of any ThumbnailCard.
+    • Prev/Next arrows navigate cards within the same folder (the list passed
+      from FolderSection).
+    • Right-click on the image fires the originating card's context-menu so all
+      card actions (Copy, Edit JSON, Add Tag, Delete) work exactly as normal.
+    • Click on the dim area (outside the image panel) closes the viewer.
+    • ESC and the × button also close the viewer.
+    """
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.hide()
+
+        self._cards: list[ThumbnailCard] = []
+        self._idx: int = 0
+        self._current_card: Optional[ThumbnailCard] = None
+
+        # ── Layout ---------------------------------------------------------
+        # The overlay has no layout manager; everything is placed manually in
+        # resizeEvent so we can precisely control the image area size.
+
+        # Dim backdrop (the overlay widget itself is the backdrop; we paint it)
+        # ── Close button (top-right)
+        self._close_btn = QToolButton(self)
+        self._close_btn.setText("✕")
+        self._close_btn.setObjectName("viewerCloseBtn")
+        self._close_btn.setFixedSize(32, 32)
+        self._close_btn.clicked.connect(self.close_viewer)
+        self._close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        # ── Image label
+        self._img_lbl = QLabel(self)
+        self._img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._img_lbl.setObjectName("viewerImage")
+        self._img_lbl.setScaledContents(False)
+        self._img_lbl.installEventFilter(self)  # capture right-click
+
+        # ── Name label (below image)
+        self._name_lbl = QLabel(self)
+        self._name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._name_lbl.setObjectName("viewerName")
+
+        # ── Prev / Next buttons
+        self._prev_btn = QToolButton(self)
+        self._prev_btn.setText("‹")
+        self._prev_btn.setObjectName("viewerNavBtn")
+        self._prev_btn.setFixedSize(44, 80)
+        self._prev_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._prev_btn.clicked.connect(self._go_prev)
+
+        self._next_btn = QToolButton(self)
+        self._next_btn.setText("›")
+        self._next_btn.setObjectName("viewerNavBtn")
+        self._next_btn.setFixedSize(44, 80)
+        self._next_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._next_btn.clicked.connect(self._go_next)
+
+    # ── Public API ─────────────────────────────────────────────────────────
+
+    def open_viewer(self, card: ThumbnailCard, cards: list[ThumbnailCard]) -> None:
+        """Show the viewer for , with  as the navigation list."""
+        self._cards = cards
+        self._idx = cards.index(card) if card in cards else 0
+        self._current_card = card
+        self.resize(self.parent().size())  # type: ignore[union-attr]
+        self._load_current()
+        self._update_nav_state()
+        self.show()
+        self.raise_()
+        self.setFocus()
+
+    def close_viewer(self) -> None:
+        self.hide()
+        self._current_card = None
+        self._cards = []
+
+    # ── Navigation ─────────────────────────────────────────────────────────
+
+    def _go_prev(self) -> None:
+        if self._idx > 0:
+            self._idx -= 1
+            self._current_card = self._cards[self._idx]
+            self._load_current()
+            self._update_nav_state()
+
+    def _go_next(self) -> None:
+        if self._idx < len(self._cards) - 1:
+            self._idx += 1
+            self._current_card = self._cards[self._idx]
+            self._load_current()
+            self._update_nav_state()
+
+    def _update_nav_state(self) -> None:
+        self._prev_btn.setEnabled(self._idx > 0)
+        self._next_btn.setEnabled(self._idx < len(self._cards) - 1)
+
+    # ── Image loading ──────────────────────────────────────────────────────
+
+    def _load_current(self) -> None:
+        card = self._current_card
+        if card is None:
+            return
+        name = card.asset.get("name", "")
+        self._name_lbl.setText(name)
+
+        path = card.asset.get("image_path", "")
+        if not path:
+            self._img_lbl.clear()
+            self._img_lbl.setText("(no image)")
+            self._place_widgets()
+            return
+
+        pix = QPixmap(path)
+        if pix.isNull():
+            self._img_lbl.setText("?")
+        else:
+            self._img_lbl.setProperty("_raw_pix", pix)
+            self._scale_image()
+        self._place_widgets()
+
+    def _scale_image(self) -> None:
+        """Scale the stored raw pixmap to fit the available image area."""
+        pix = self._img_lbl.property("_raw_pix")
+        if pix is None or pix.isNull():
+            return
+        max_w, max_h = self._image_area_size()
+        scaled = pix.scaled(
+            max_w, max_h,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self._img_lbl.setPixmap(scaled)
+        self._img_lbl.resize(scaled.width(), scaled.height())
+
+    def _image_area_size(self) -> tuple[int, int]:
+        """Return (max_w, max_h) for the image, leaving room for name + margins."""
+        w = self.width()
+        h = self.height()
+        margin_x = 110  # space for prev/next buttons + padding
+        margin_y = 100  # space for name label + padding
+        return max(200, w - margin_x * 2), max(200, h - margin_y)
+
+    # ── Widget placement ───────────────────────────────────────────────────
+
+    def _place_widgets(self) -> None:
+        """Manually position all child widgets relative to the overlay size."""
+        ow, oh = self.width(), self.height()
+
+        # Close button – top right
+        pad = 14
+        self._close_btn.move(ow - self._close_btn.width() - pad, pad)
+
+        # Image – centred in available area (vertically biased slightly upward)
+        img_w = self._img_lbl.width()
+        img_h = self._img_lbl.height()
+        img_x = (ow - img_w) // 2
+        img_y = max(50, (oh - img_h - 40) // 2)  # 40 = room for name below
+        self._img_lbl.move(img_x, img_y)
+
+        # Name label – directly below image
+        name_h = 28
+        self._name_lbl.setFixedSize(min(600, ow - 40), name_h)
+        name_x = (ow - self._name_lbl.width()) // 2
+        name_y = img_y + img_h + 10
+        self._name_lbl.move(name_x, name_y)
+
+        # Prev / next – vertically centred on the image
+        btn_y = img_y + (img_h - self._prev_btn.height()) // 2
+        left_edge  = img_x - self._prev_btn.width() - 12
+        right_edge = img_x + img_w + 12
+        self._prev_btn.move(max(8, left_edge), btn_y)
+        self._next_btn.move(min(ow - self._next_btn.width() - 8, right_edge), btn_y)
+
+    # ── Events ─────────────────────────────────────────────────────────────
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self.isVisible():
+            self._scale_image()
+            self._place_widgets()
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(0, 0, 0, 180))
+        p.end()
+
+    def mousePressEvent(self, event) -> None:
+        """Click outside the image panel closes the viewer."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            img_rect = self._img_lbl.geometry()
+            if not img_rect.contains(event.position().toPoint()):
+                self.close_viewer()
+                return
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        key = event.key()
+        if key == Qt.Key.Key_Escape:
+            self.close_viewer()
+        elif key == Qt.Key.Key_Left:
+            self._go_prev()
+        elif key == Qt.Key.Key_Right:
+            self._go_next()
+        else:
+            super().keyPressEvent(event)
+
+    def eventFilter(self, obj, event) -> bool:
+        """Intercept right-click on the image label → delegate to card's context menu."""
+        if obj is self._img_lbl and event.type() == QEvent.Type.MouseButtonPress:
+            if event.button() == Qt.MouseButton.RightButton and self._current_card:
+                # Synthesise a context-menu event on the card
+                global_pos = self._img_lbl.mapToGlobal(event.position().toPoint())
+                from PySide6.QtGui import QContextMenuEvent
+                ctx = QContextMenuEvent(QContextMenuEvent.Reason.Mouse, QPoint(0, 0), global_pos)
+                QApplication.sendEvent(self._current_card, ctx)
+                return True
+        return super().eventFilter(obj, event)
+
+
 # ── Main Window ────────────────────────────────────────────────────────────────
 
 
@@ -2837,6 +3064,7 @@ class MainWindow(QMainWindow):
         self._pre_search_scroll: int = 0
         self._script_runner: Optional[ScriptRunner] = None
         self._note_window: Optional[NoteWindow] = None
+        self._img_viewer: Optional[ImgViewerOverlay] = None
 
         # ── DEV MODE: create the in-memory stub database once here.
         #    This reference is ONLY ever used when DEV_MODE is True.
@@ -2918,6 +3146,12 @@ class MainWindow(QMainWindow):
         self._results.setMinimumHeight(340)
         outer.addWidget(self._results, 1)
         # Indexing is started by run_startup_scripts() called after show()
+
+        # ── Image Viewer Overlay ───────────────────────────────────────────
+        # Parented to the central widget so it covers the full app area.
+        self._img_viewer = ImgViewerOverlay(root)
+        self._img_viewer.resize(root.size())
+        self._results.card_view_requested.connect(self._img_viewer.open_viewer)
 
     # ── Startup script execution ──────────────────────────────────────────
 
@@ -3190,6 +3424,13 @@ class MainWindow(QMainWindow):
         #    nothing is written to disk. Changes are lost on close.
         dlg = StartupScriptsDialog(self, readonly=DEV_MODE)
         dlg.exec()
+
+    # ── Resize: keep overlay filling the central widget ──────────────────
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._img_viewer is not None:
+            self._img_viewer.resize(self.centralWidget().size())
 
     # ── Keyboard shortcuts ────────────────────────────────────────────────
 
@@ -3857,9 +4098,9 @@ class NoteWindow(QDialog):
         # Make the dialog background match the main app window exactly
         self.setObjectName("noteWindowRoot")
 
-        # Restore session-only position (resets to centre on each app start).
-        # If no session position exists, showEvent will centre the window once shown.
-        pos = _SESSION_POS.get("note_window_pos")
+        # Restore saved position/size
+        prefs = _load_prefs()
+        pos = prefs.get("note_window_pos")
         if pos and len(pos) == 2:
             self.move(pos[0], pos[1])
 
@@ -3899,25 +4140,10 @@ class NoteWindow(QDialog):
         lay.addWidget(self._panel, 1)
 
     def closeEvent(self, event) -> None:
-        _SESSION_POS["note_window_pos"] = [self.x(), self.y()]
+        prefs = _load_prefs()
+        prefs["note_window_pos"] = [self.x(), self.y()]
+        _save_prefs(prefs)
         super().closeEvent(event)
-
-    def showEvent(self, event) -> None:
-        super().showEvent(event)
-        # Centre over the parent on the very first show of each session.
-        # If the user already moved the window this session, _SESSION_POS will
-        # have been set in closeEvent and the __init__ move() will have placed
-        # it correctly, so we only centre when no session position exists.
-        if "note_window_pos" not in _SESSION_POS:
-            parent = self.parent()
-            if parent is not None:
-                pw = parent.window()
-                center = pw.frameGeometry().center()
-            else:
-                center = QApplication.primaryScreen().availableGeometry().center()
-            fg = self.frameGeometry()
-            fg.moveCenter(center)
-            self.move(fg.topLeft())
 
     def show_and_reload(self) -> None:
         """Show (or raise) the window and reload note data."""
@@ -4378,6 +4604,52 @@ def apply_style(app: QApplication) -> None:
         QScrollBar::handle:vertical:hover {{ background: rgba(123,142,232,0.40); }}
         QScrollBar::add-line:vertical,
         QScrollBar::sub-line:vertical     {{ height: 0; }}
+
+        /* ── image viewer overlay ────────────────────────────────────── */
+        #viewerCloseBtn {{
+            background: transparent;
+            border: none;
+            color: rgba(200,205,230,0.55);
+            font-size: 16px;
+            font-weight: 400;
+            border-radius: 16px;
+        }}
+        #viewerCloseBtn:hover {{
+            background: rgba(255,255,255,0.10);
+            color: rgba(220,225,245,0.90);
+        }}
+
+        #viewerName {{
+            color: rgba(200,205,235,0.75);
+            font-size: 12px;
+            background: transparent;
+        }}
+
+        #viewerNavBtn {{
+            background: rgba(255,255,255,0.06);
+            border: 1px solid rgba(255,255,255,0.10);
+            border-radius: 6px;
+            color: rgba(200,205,235,0.70);
+            font-size: 28px;
+            font-weight: 300;
+        }}
+        #viewerNavBtn:hover {{
+            background: rgba(123,142,232,0.22);
+            border-color: rgba(123,142,232,0.45);
+            color: rgba(200,215,255,0.95);
+        }}
+        #viewerNavBtn:pressed {{
+            background: rgba(123,142,232,0.10);
+        }}
+        #viewerNavBtn:disabled {{
+            background: transparent;
+            border-color: rgba(255,255,255,0.04);
+            color: rgba(255,255,255,0.15);
+        }}
+
+        #viewerImage {{
+            background: transparent;
+        }}
     """)
 
 
