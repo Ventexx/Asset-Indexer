@@ -91,6 +91,111 @@ def _save_prefs(data: dict) -> None:
         pass
 
 
+# ── File Cache ─────────────────────────────────────────────────────────────────
+#
+# One JSON file per database, stored at APP_DIR/<name>_file_cache.json.
+# Structure:
+#   {
+#     "/abs/path/to/asset.png": {
+#       "png_mtime": 1234567890.123,
+#       "json_mtime": 1234567891.456
+#     },
+#     ...
+#   }
+#
+# Only PNG+JSON pairs that both exist are tracked (mirrors _run_index behaviour).
+# The file is written atomically (temp → rename) so a crash mid-write never
+# leaves a corrupt cache behind.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _cache_path(name: str) -> Path:
+    return APP_DIR / f"{name}_file_cache.json"
+
+
+def _load_file_cache(name: str) -> dict[str, dict]:
+    """Return the stored {png_path: {png_mtime, json_mtime}} mapping, or {}."""
+    path = _cache_path(name)
+    try:
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_file_cache(name: str, data: dict[str, dict]) -> None:
+    """Atomically write the cache so a crash mid-write leaves the old file intact."""
+    try:
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = _cache_path(name).with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp.replace(_cache_path(name))
+    except Exception:
+        pass
+
+
+def _build_file_cache(folder: Path) -> dict[str, dict]:
+    """
+    Walk `folder` and build a fresh cache dict from the current filesystem state.
+    Only includes PNG+JSON pairs where both files exist.
+    Called after a successful index to update the on-disk cache.
+    """
+    result: dict[str, dict] = {}
+    for png in sorted(folder.rglob("*.png")):
+        jpath = png.with_suffix(".json")
+        if not jpath.exists():
+            continue
+        try:
+            result[str(png)] = {
+                "png_mtime": png.stat().st_mtime,
+                "json_mtime": jpath.stat().st_mtime,
+            }
+        except OSError:
+            pass
+    return result
+
+
+def _diff_against_cache(
+    folder: Path, cache: dict[str, dict]
+) -> tuple[set[str], set[str], set[str]]:
+    """
+    Fast os.stat pass over `folder`.  Returns three sets of PNG paths:
+      added   – present on disk but not in cache
+      changed – present in both but at least one mtime differs
+      deleted – present in cache but no longer on disk (as a valid pair)
+
+    No file contents are read; only st_mtime is checked.
+    """
+    added: set[str] = set()
+    changed: set[str] = set()
+    seen: set[str] = set()
+
+    for png in folder.rglob("*.png"):
+        jpath = png.with_suffix(".json")
+        if not jpath.exists():
+            continue  # unpaired – skip, same rule as _run_index
+        key = str(png)
+        seen.add(key)
+        try:
+            png_mtime = png.stat().st_mtime
+            json_mtime = jpath.stat().st_mtime
+        except OSError:
+            continue
+
+        if key not in cache:
+            added.add(key)
+        else:
+            cached = cache[key]
+            if png_mtime != cached.get("png_mtime") or json_mtime != cached.get("json_mtime"):
+                changed.add(key)
+
+    deleted: set[str] = set(cache.keys()) - seen
+    return added, changed, deleted
+
+
 # ── Startup Scripts ────────────────────────────────────────────────────────────
 
 SCRIPTS_FILE = APP_DIR / "startup_scripts.json"
@@ -146,11 +251,17 @@ def _run_index(
     folder: Path,
     full_rebuild: bool = False,
     progress_cb=None,  # callable(current, total, msg) or None
+    flagged: Optional[tuple[set[str], set[str], set[str]]] = None,
 ) -> tuple[int, int]:
     """
     Opens a *fresh* SQLite connection on the calling thread, indexes `folder`,
     and closes the connection before returning.  Safe to call from any thread.
     Returns (total_assets, changes).
+
+    flagged: if provided, a (added, changed, deleted) tuple of PNG path sets
+             produced by _diff_against_cache().  Only those files are touched;
+             everything else in the DB is left as-is.  When None (or when
+             full_rebuild is True) the original full-scan behaviour runs.
     """
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
@@ -173,6 +284,54 @@ def _run_index(
             r[0] for r in conn.execute("SELECT image_path FROM assets").fetchall()
         }
 
+        # ── Selective (cache-diff) path ───────────────────────────────────────
+        # When the caller has already diffed against the file cache we only
+        # need to process the flagged files instead of scanning everything.
+        if flagged is not None and not full_rebuild:
+            added, changed, deleted = flagged
+
+            # Process deleted first – just remove from DB
+            for p in deleted:
+                conn.execute("DELETE FROM assets WHERE image_path=?", (p,))
+
+            to_process = sorted(added | changed)
+            total = len(to_process)
+            changes = len(deleted)
+
+            for i, key in enumerate(to_process, 1):
+                png = Path(key)
+                jpath = png.with_suffix(".json")
+                try:
+                    raw = jpath.read_text(encoding="utf-8", errors="ignore")
+                    json.loads(raw)
+                except Exception:
+                    raw = "{}"
+
+                rel_folder = str(png.parent.relative_to(folder))
+                if rel_folder == ".":
+                    rel_folder = ""
+
+                if key not in existing:
+                    conn.execute(
+                        "INSERT INTO assets(name, folder, image_path, json_path, json_data)"
+                        " VALUES(?,?,?,?,?)",
+                        (png.stem, rel_folder, key, str(jpath), raw),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE assets SET json_data=?, folder=? WHERE image_path=?",
+                        (raw, rel_folder, key),
+                    )
+                changes += 1
+
+                if progress_cb:
+                    progress_cb(i, total, f"Indexing ({i}/{total})")
+
+            conn.commit()
+            db_total: int = conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
+            return db_total, changes
+
+        # ── Full scan path (original behaviour) ───────────────────────────────
         candidates = [
             png
             for png in sorted(folder.rglob("*.png"))
@@ -605,6 +764,10 @@ class Database:
         )
         self._conn.commit()
 
+    def count(self) -> int:
+        """Return the total number of indexed assets."""
+        return self._conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
+
     def delete(self, image_path: str) -> None:
         self._conn.execute("DELETE FROM assets WHERE image_path=?", (image_path,))
         self._conn.commit()
@@ -673,11 +836,17 @@ class DatabaseManager:
         db = self._dbs.pop(name, None)
         if db:
             db.close()
-        # Delete the .db file if it exists (gracefully skip if already gone)
+        # Delete the .db file and its cache if they exist
         db_file = APP_DIR / f"{name}.db"
         try:
             if db_file.exists():
                 db_file.unlink()
+        except Exception:
+            pass
+        try:
+            cf = _cache_path(name)
+            if cf.exists():
+                cf.unlink()
         except Exception:
             pass
         # Remove from roots registry and persist
@@ -757,17 +926,26 @@ class IndexWorker(QThread):
     progress = Signal(int, int, str)  # current, total, message
     finished = Signal(int)  # final total
 
-    def __init__(self, db_path: Path, folder: Path, full_rebuild: bool = False):
+    def __init__(
+        self,
+        db_path: Path,
+        folder: Path,
+        full_rebuild: bool = False,
+        flagged: Optional[tuple[set[str], set[str], set[str]]] = None,
+    ):
         super().__init__()
         self._db_path = db_path
         self._folder = folder
         self._full_rebuild = full_rebuild
+        self._flagged = flagged  # (added, changed, deleted) or None for full scan
 
     def run(self) -> None:
         def _cb(current, total, msg):
             self.progress.emit(current, total, msg)
 
-        total, _ = _run_index(self._db_path, self._folder, self._full_rebuild, _cb)
+        total, _ = _run_index(
+            self._db_path, self._folder, self._full_rebuild, _cb, self._flagged
+        )
         self.finished.emit(total)
 
 
@@ -2616,8 +2794,13 @@ class MainWindow(QMainWindow):
         self._results.set_db(db, root_folder)
         self._do_search()
 
-    def _start_load_db(self, name: str) -> None:
-        """Begin background indexing for a database, showing the loading overlay."""
+    def _start_load_db(self, name: str, full_rebuild: bool = False) -> None:
+        """Begin background indexing for a database, showing the loading overlay.
+
+        On a normal (non-rebuild) startup the file cache is diffed first so only
+        changed/added/deleted files are re-indexed.  If no files changed at all
+        the worker is skipped entirely.  full_rebuild bypasses the cache.
+        """
         if self._index_worker and self._index_worker.isRunning():
             return  # already busy
 
@@ -2637,9 +2820,33 @@ class MainWindow(QMainWindow):
             self._set_active_db(name)
             return
 
-        worker = IndexWorker(db.path, folder, full_rebuild=False)
+        # ── Cache diff (skipped on full rebuild) ─────────────────────────────────────────
+        flagged: Optional[tuple[set[str], set[str], set[str]]] = None
+        if not full_rebuild:
+            cache = _load_file_cache(name)
+            if cache:
+                self._results.update_loading("Checking for changes...")
+                self._set_status("Checking for changes...")
+                QApplication.processEvents()
+                added, changed, deleted = _diff_against_cache(folder, cache)
+                flagged = (added, changed, deleted)
+                n_changes = len(added) + len(changed) + len(deleted)
+                if n_changes == 0:
+                    # Nothing changed — skip indexing entirely
+                    self._results.hide_loading()
+                    self._search.setEnabled(True)
+                    self._menu_btn.setEnabled(True)
+                    self._set_active_db(name)
+                    db_total = db.count()
+                    self._set_status(f"{db_total} assets (no changes)")
+                    return
+            # No cache yet (first run) — flagged stays None → full scan
+
+        worker = IndexWorker(db.path, folder, full_rebuild=full_rebuild, flagged=flagged)
         worker.progress.connect(self._on_index_progress)
-        worker.finished.connect(lambda total: self._on_index_finished(name, total))
+        worker.finished.connect(
+            lambda total, n=name, rb=full_rebuild: self._on_index_finished(n, total, rb)
+        )
         self._index_worker = worker
         worker.start()
 
@@ -2647,7 +2854,7 @@ class MainWindow(QMainWindow):
         self._results.update_loading(msg)
         self._set_status(msg)
 
-    def _on_index_finished(self, name: str, total: int) -> None:
+    def _on_index_finished(self, name: str, total: int, full_rebuild: bool = False) -> None:
         # Don't hide the overlay yet - _set_active_db → refresh() will show
         # "Rendering..." and hide the overlay once _populate() completes.
         self._search.setEnabled(True)
@@ -2655,6 +2862,14 @@ class MainWindow(QMainWindow):
         self._set_active_db(name)
         self._set_status(f"{total} assets")
         self._index_worker = None
+
+        # ── Write updated file cache after a successful index ───────────────────
+        # Rebuild the cache from disk so it reflects the current state exactly.
+        # Runs in the main thread after indexing; the rglob is stat-only (fast).
+        folder = self.db_manager.root_for(name)
+        if folder is not None and folder.exists():
+            new_cache = _build_file_cache(folder)
+            _save_file_cache(name, new_cache)
 
     def _open_note_window(self) -> None:
         if self._note_window is None:
