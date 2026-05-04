@@ -65,6 +65,11 @@ ICON_PATH = Path(__file__).parent / "Icon.png"
 PREFS_FILE = APP_DIR / "prefs.json"
 NOTES_FILE = APP_DIR / "notes.json"
 
+# ── Session-only window positions ─────────────────────────────────────────────
+# Positions are stored here (in memory) when a dialog is dragged or closed.
+# They are NEVER written to disk, so every app restart centres dialogs fresh.
+_SESSION_POS: dict[str, list[int]] = {}
+
 # 2:3 card image area
 THUMB_W = 106
 THUMB_H = 159
@@ -1019,7 +1024,13 @@ class IndexWorker(QThread):
 
 
 class _DraggableDialog(QDialog):
-    """Base for frameless dialogs that are draggable and remember position."""
+    """Base for frameless dialogs that are draggable and remember position.
+
+    Position memory is session-only (stored in _SESSION_POS, never on disk).
+    On the first open after each app start the dialog centres itself over its
+    parent window; after the user drags it, the new position is remembered for
+    the rest of that session.
+    """
 
     _PREFS_KEY: str = ""  # subclasses set this
 
@@ -1027,22 +1038,34 @@ class _DraggableDialog(QDialog):
         super().__init__(parent)
         self._drag_pos: Optional[QPoint] = None
 
+    def _center_on_parent(self) -> None:
+        """Move this dialog to the centre of its parent's current geometry."""
+        parent = self.parent()
+        if parent is not None:
+            # Use the top-level window's *current* frame geometry so we follow
+            # the window even if the user has dragged it to another monitor.
+            center = parent.window().frameGeometry().center()
+        else:
+            center = QApplication.primaryScreen().availableGeometry().center()
+        fg = self.frameGeometry()
+        fg.moveCenter(center)
+        self.move(fg.topLeft())
+
     def _restore_pos(self) -> None:
+        """Use session memory position, or centre on parent if not yet moved."""
         key = self._PREFS_KEY
-        if not key:
-            return
-        prefs = _load_prefs()
-        pos = prefs.get(key)
+        pos = _SESSION_POS.get(key) if key else None
         if pos and len(pos) == 2:
             self.move(pos[0], pos[1])
+        else:
+            self._center_on_parent()
 
     def _save_pos(self) -> None:
+        """Remember position in session memory (never written to disk)."""
         key = self._PREFS_KEY
         if not key:
             return
-        prefs = _load_prefs()
-        prefs[key] = [self.x(), self.y()]
-        _save_prefs(prefs)
+        _SESSION_POS[key] = [self.x(), self.y()]
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -4098,9 +4121,9 @@ class NoteWindow(QDialog):
         # Make the dialog background match the main app window exactly
         self.setObjectName("noteWindowRoot")
 
-        # Restore saved position/size
-        prefs = _load_prefs()
-        pos = prefs.get("note_window_pos")
+        # Restore session-only position (resets to centre each app start).
+        # Actual centering happens in showEvent once geometry is finalised.
+        pos = _SESSION_POS.get("note_window_pos")
         if pos and len(pos) == 2:
             self.move(pos[0], pos[1])
 
@@ -4140,10 +4163,23 @@ class NoteWindow(QDialog):
         lay.addWidget(self._panel, 1)
 
     def closeEvent(self, event) -> None:
-        prefs = _load_prefs()
-        prefs["note_window_pos"] = [self.x(), self.y()]
-        _save_prefs(prefs)
+        _SESSION_POS["note_window_pos"] = [self.x(), self.y()]
         super().closeEvent(event)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        # Centre over the parent on the very first show of each session.
+        # If the user moved the window this session, _SESSION_POS will have been
+        # set in closeEvent and the __init__ move() placed it correctly already.
+        if "note_window_pos" not in _SESSION_POS:
+            parent = self.parent()
+            if parent is not None:
+                center = parent.window().frameGeometry().center()
+            else:
+                center = QApplication.primaryScreen().availableGeometry().center()
+            fg = self.frameGeometry()
+            fg.moveCenter(center)
+            self.move(fg.topLeft())
 
     def show_and_reload(self) -> None:
         """Show (or raise) the window and reload note data."""
@@ -4607,44 +4643,49 @@ def apply_style(app: QApplication) -> None:
 
         /* ── image viewer overlay ────────────────────────────────────── */
         #viewerCloseBtn {{
-            background: transparent;
-            border: none;
-            color: rgba(200,205,230,0.55);
-            font-size: 16px;
+            background: rgba(255,255,255,0.06);
+            border: 1px solid rgba(255,255,255,0.10);
+            color: rgba(210,215,235,0.50);
+            font-size: 15px;
             font-weight: 400;
             border-radius: 16px;
         }}
         #viewerCloseBtn:hover {{
-            background: rgba(255,255,255,0.10);
-            color: rgba(220,225,245,0.90);
+            background: rgba(200,50,50,0.28);
+            border-color: rgba(220,70,70,0.50);
+            color: rgba(240,90,90,0.95);
+        }}
+        #viewerCloseBtn:pressed {{
+            background: rgba(180,40,40,0.18);
         }}
 
         #viewerName {{
-            color: rgba(200,205,235,0.75);
+            color: rgba(200,205,235,0.70);
             font-size: 12px;
             background: transparent;
         }}
 
         #viewerNavBtn {{
-            background: rgba(255,255,255,0.06);
-            border: 1px solid rgba(255,255,255,0.10);
-            border-radius: 6px;
-            color: rgba(200,205,235,0.70);
-            font-size: 28px;
+            background: rgba(15,18,28,0.72);
+            border: 1px solid rgba(255,255,255,0.14);
+            border-radius: 8px;
+            color: rgba(210,215,240,0.82);
+            font-size: 30px;
             font-weight: 300;
         }}
         #viewerNavBtn:hover {{
-            background: rgba(123,142,232,0.22);
-            border-color: rgba(123,142,232,0.45);
-            color: rgba(200,215,255,0.95);
+            background: rgba(30,36,58,0.90);
+            border-color: rgba(123,142,232,0.55);
+            color: rgba(160,180,255,1.0);
         }}
         #viewerNavBtn:pressed {{
-            background: rgba(123,142,232,0.10);
+            background: rgba(20,25,42,0.85);
+            color: rgba(130,155,235,0.90);
         }}
         #viewerNavBtn:disabled {{
-            background: transparent;
-            border-color: rgba(255,255,255,0.04);
-            color: rgba(255,255,255,0.15);
+            background: rgba(10,12,18,0.30);
+            border-color: rgba(255,255,255,0.05);
+            color: rgba(255,255,255,0.12);
         }}
 
         #viewerImage {{
