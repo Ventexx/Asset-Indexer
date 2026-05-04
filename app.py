@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import sqlite3
 import subprocess
 import sys
@@ -227,6 +228,7 @@ _PIXMAP_CACHE: dict[str, QPixmap] = {}
 
 
 def _load_pixmap(path: str) -> QPixmap:
+    """Return a cached thumbnail pixmap, or load+scale synchronously (drag fallback)."""
     if path not in _PIXMAP_CACHE:
         pix = QPixmap(path)
         if not pix.isNull():
@@ -241,6 +243,70 @@ def _load_pixmap(path: str) -> QPixmap:
             pix = scaled.copy(x, y, THUMB_W, THUMB_H)
         _PIXMAP_CACHE[path] = pix
     return _PIXMAP_CACHE[path]
+
+
+# ── Background Pixmap Loader ───────────────────────────────────────────────────
+#
+# A single long-lived worker thread that drains a queue of (card, path) pairs.
+# Each pixmap is loaded and scaled off the main thread, then delivered via signal
+# so the card can set it without ever blocking the UI.
+#
+# Usage:
+#   PIXMAP_WORKER.submit(card, image_path)
+#
+# The worker is started once at module level and runs for the lifetime of the app.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class PixmapWorker(QThread):
+    """Loads and scales thumbnail pixmaps off the main thread."""
+
+    # Delivers (card_widget, pixmap) back to the main thread
+    pixmap_ready = Signal(object, QPixmap)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._queue: queue.Queue = queue.Queue()
+
+    def submit(self, card: "ThumbnailCard", path: str) -> None:
+        """Queue a card for image loading. Safe to call from the main thread."""
+        self._queue.put((card, path))
+
+    def run(self) -> None:
+        while True:
+            try:
+                card, path = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            # Skip if the card was already deleted (e.g. after a search refresh)
+            try:
+                if card is None:
+                    continue
+            except RuntimeError:
+                continue
+
+            # Load into the shared cache if not already present
+            if path not in _PIXMAP_CACHE:
+                pix = QPixmap(path)
+                if not pix.isNull():
+                    scaled = pix.scaled(
+                        THUMB_W,
+                        THUMB_H,
+                        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                    x = (scaled.width() - THUMB_W) // 2
+                    y = (scaled.height() - THUMB_H) // 2
+                    pix = scaled.copy(x, y, THUMB_W, THUMB_H)
+                _PIXMAP_CACHE[path] = pix
+
+            self.pixmap_ready.emit(card, _PIXMAP_CACHE[path])
+
+
+# Single global worker — started once, lives for the whole app session.
+PIXMAP_WORKER = PixmapWorker()
+PIXMAP_WORKER.start()
 
 
 # ── Index logic (thread-safe, opens its own connection) ───────────────────────
@@ -1332,7 +1398,53 @@ class ThumbnailCard(QWidget):
         self._name_lbl.setMaximumWidth(THUMB_W)
         lay.addWidget(self._name_lbl)
 
-        QTimer.singleShot(0, self._apply_pixmap)
+        self._image_loaded = False
+
+        # Connect once to the global worker so pixmaps arrive on the main thread
+        PIXMAP_WORKER.pixmap_ready.connect(self._on_pixmap_ready)
+
+    def request_image(self) -> None:
+        """Called by FolderSection when the folder is expanded.  No-op if already loaded."""
+        if self._image_loaded:
+            return
+        path = self.asset.get("image_path", "")
+        if not path:
+            return
+        # If the pixmap is already cached (e.g. same folder reopened), apply instantly
+        if path in _PIXMAP_CACHE:
+            self._apply_pixmap_data(_PIXMAP_CACHE[path])
+        else:
+            PIXMAP_WORKER.submit(self, path)
+
+    def _on_pixmap_ready(self, card: "ThumbnailCard", pix: QPixmap) -> None:
+        """Slot called on the main thread when the worker finishes a pixmap."""
+        if card is not self:
+            return
+        self._apply_pixmap_data(pix)
+        # Disconnect to avoid accumulating dead connections after many refreshes
+        try:
+            PIXMAP_WORKER.pixmap_ready.disconnect(self._on_pixmap_ready)
+        except RuntimeError:
+            pass
+
+    def _apply_pixmap_data(self, pix: QPixmap) -> None:
+        """Render the rounded thumbnail from an already-scaled pixmap."""
+        from PySide6.QtGui import QPainterPath
+
+        self._image_loaded = True
+        if not pix.isNull():
+            rounded = QPixmap(THUMB_W, THUMB_H)
+            rounded.fill(Qt.GlobalColor.transparent)
+            p = QPainter(rounded)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            path = QPainterPath()
+            path.addRoundedRect(0, 0, THUMB_W, THUMB_H, 7, 7)
+            p.setClipPath(path)
+            p.drawPixmap(0, 0, pix)
+            p.end()
+            self._img_lbl.setPixmap(rounded)
+        else:
+            self._img_lbl.setText("?")
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -1381,24 +1493,6 @@ class ThumbnailCard(QWidget):
         self._hovered = False
         self.update()
         super().leaveEvent(event)
-
-    def _apply_pixmap(self) -> None:
-        from PySide6.QtGui import QPainterPath
-
-        pix = _load_pixmap(self.asset["image_path"])
-        if not pix.isNull():
-            rounded = QPixmap(THUMB_W, THUMB_H)
-            rounded.fill(Qt.GlobalColor.transparent)
-            p = QPainter(rounded)
-            p.setRenderHint(QPainter.RenderHint.Antialiasing)
-            path = QPainterPath()
-            path.addRoundedRect(0, 0, THUMB_W, THUMB_H, 7, 7)
-            p.setClipPath(path)
-            p.drawPixmap(0, 0, pix)
-            p.end()
-            self._img_lbl.setPixmap(rounded)
-        else:
-            self._img_lbl.setText("?")
 
     def paintEvent(self, event) -> None:
         from PySide6.QtGui import QPainterPath, QPen
@@ -1691,6 +1785,9 @@ class FolderSection(QWidget):
         if self._expanded and self._cards:
             self._current_cols = 0  # force reflow on next call
             QTimer.singleShot(0, self._relayout_cards)
+            # Kick off background image loading for every card in this folder
+            for card in self._cards:
+                card.request_image()
 
     def _on_header_context_menu(self, global_pos) -> None:
         # Context menu only available when folder is expanded
