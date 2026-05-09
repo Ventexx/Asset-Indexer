@@ -731,14 +731,19 @@ class DevDatabase:
 
     # ── API surface (matches Database) ────────────────────────────────────
 
-    def search(self, query: str, limit: int = 2000) -> list[dict]:
-        """Filter fake assets by name, case-insensitive substring match."""
+    def search(self, query: str, limit: int = 2000, folder_only: bool = False) -> list[dict]:
+        """Filter fake assets by name (or folder name), case-insensitive substring match."""
         q = query.lower()
-        results = (
-            [a for a in self._assets if q in a["name"].lower()]
-            if q
-            else list(self._assets)
-        )
+        if not q:
+            return list(self._assets)[:limit]
+        if folder_only:
+            # Collect unique folder names that contain the query
+            matching_folders = {
+                a["folder"] for a in self._assets if q in a["folder"].lower()
+            }
+            results = [a for a in self._assets if a["folder"] in matching_folders]
+        else:
+            results = [a for a in self._assets if q in a["name"].lower()]
         return results[:limit]
 
     def get_folder_meta(self, folder_key: str) -> Optional[str]:
@@ -813,12 +818,20 @@ class Database:
         """Blocking index on the *calling* thread's connection. Returns (total, changes)."""
         return _run_index(self.path, folder, full_rebuild, progress_cb=None)
 
-    def search(self, query: str, limit: int = 2000) -> list[dict]:
+    def search(self, query: str, limit: int = 2000, folder_only: bool = False) -> list[dict]:
         q = f"%{query}%"
-        rows = self._conn.execute(
-            "SELECT * FROM assets WHERE name LIKE ? ORDER BY folder, name LIMIT ?",
-            (q, limit),
-        ).fetchall()
+        if folder_only:
+            # Return all assets that belong to folders whose relative path contains
+            # the query string (covers both shallow and nested folder names).
+            rows = self._conn.execute(
+                "SELECT * FROM assets WHERE folder LIKE ? ORDER BY folder, name LIMIT ?",
+                (q, limit),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM assets WHERE name LIKE ? ORDER BY folder, name LIMIT ?",
+                (q, limit),
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def get_folder_meta(self, folder_key: str) -> Optional[str]:
@@ -2053,8 +2066,9 @@ class ResultsPanel(QScrollArea):
         query: str = "",
         restore_keys: Optional[set[str]] = None,
         restore_scroll: int = 0,
+        folder_only: bool = False,
     ) -> None:
-        assets = self._db.search(query) if self._db else []
+        assets = self._db.search(query, folder_only=folder_only) if self._db else []
         if assets:
             # Show a message BEFORE the UI freezes while rendering all thumbnails.
             # processEvents() flushes it to screen before the heavy _populate() call.
@@ -3338,7 +3352,15 @@ class MainWindow(QMainWindow):
         self._search_timer.stop()
         text = self._search.text().strip()
 
-        if not text and self._pre_search_expanded is not None:
+        # ── Folder-only mode: query ending with ' f' ──────────────────────────
+        # e.g. "pokemon f" → search only folder names for "pokemon"
+        folder_only = False
+        effective_text = text
+        if text.lower().endswith(" f"):
+            folder_only = True
+            effective_text = text[:-2].strip()  # strip the trailing ' f'
+
+        if not effective_text and not folder_only and self._pre_search_expanded is not None:
             # Search cleared → restore exactly where the user was
             self._results.refresh(
                 "",
@@ -3348,7 +3370,7 @@ class MainWindow(QMainWindow):
             self._pre_search_expanded = None
             self._pre_search_scroll = 0
         else:
-            self._results.refresh(text)
+            self._results.refresh(effective_text, folder_only=folder_only)
 
     def _set_status(self, msg: str) -> None:
         self._status_lbl.setText(msg)
