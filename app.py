@@ -3544,9 +3544,15 @@ def _ensure_az_sort_flag(data: dict) -> dict:
 
 
 def _flatten_notes(data: dict, query: str = "", category_path: str = "") -> list[dict]:
-    """Recursively flatten notes JSON into {name, value, category} dicts."""
+    """Recursively flatten notes JSON into {name, value, category} dicts.
+
+    The 'A-Z Sort in Folder' key is a control flag, not a user entry; it is
+    silently skipped at every level so it never appears as a copyable card.
+    """
     results: list[dict] = []
     for key, value in data.items():
+        if key == _AZ_SORT_KEY:
+            continue  # internal flag – never shown as a card
         if isinstance(value, str):
             if not query or query.lower() in key.lower():
                 results.append({"name": key, "value": value, "category": category_path})
@@ -3724,12 +3730,20 @@ class NoteSection(QWidget):
         self,
         title: str,
         depth: int = 0,
+        notes_file: Optional[Path] = None,
+        category_path: str = "",
+        global_az_sort: bool = True,
+        panel: Optional["NotePanel"] = None,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
         self._expanded = False
         self._depth = depth
         self._child_sections: list["NoteSection"] = []
+        self._notes_file = notes_file
+        self._category_path = category_path   # e.g. "Animals/Dogs"
+        self._global_az_sort = global_az_sort
+        self._panel_ref: Optional["NotePanel"] = panel
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -3754,7 +3768,10 @@ class NoteSection(QWidget):
         self._header.setFixedHeight(24 if depth == 0 else 22)
         self._header.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self._header.clicked.connect(self._toggle)
-        # No context menu on note folder headers
+        self._header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._header.customContextMenuRequested.connect(
+            lambda pos: self._on_header_context_menu(self._header.mapToGlobal(pos))
+        )
 
         hc_lay.addWidget(self._header)
         hc_lay.addStretch()
@@ -3784,6 +3801,76 @@ class NoteSection(QWidget):
 
         self._cards: list[NoteEntryCard] = []
         self._current_cols: int = COLS
+
+    def _get_local_az_sort(self) -> Optional[bool]:
+        """Return folder-local 'A-Z Sort in Folder' from notes.json, or None if absent."""
+        if not self._notes_file or not self._notes_file.exists() or not self._category_path:
+            return None
+        try:
+            data = json.loads(self._notes_file.read_text(encoding="utf-8", errors="ignore"))
+            # Navigate to this folder's dict
+            parts = self._category_path.split("/")
+            node = data
+            for part in parts:
+                if not isinstance(node, dict) or part not in node:
+                    return None
+                node = node[part]
+            if isinstance(node, dict) and _AZ_SORT_KEY in node:
+                return bool(node[_AZ_SORT_KEY])
+        except Exception:
+            pass
+        return None
+
+    def _toggle_az_sort(self, current_effective: bool) -> None:
+        """Write the inverse of current_effective into this folder's dict in notes.json."""
+        if not self._notes_file or not self._category_path:
+            return
+        try:
+            data = (
+                json.loads(self._notes_file.read_text(encoding="utf-8", errors="ignore"))
+                if self._notes_file.exists()
+                else {}
+            )
+        except Exception:
+            data = {}
+
+        # Navigate to this folder's dict, preserving existing content at each level
+        parts = self._category_path.split("/")
+        node = data
+        for part in parts:
+            existing = node.get(part)
+            if not isinstance(existing, dict):
+                node[part] = {}
+            node = node[part]
+
+        node[_AZ_SORT_KEY] = not current_effective
+        _save_notes(data)
+
+        # Reload the panel so the new sort takes effect immediately
+        if self._panel_ref is not None:
+            self._panel_ref.reload(self._panel_ref._current_query)
+
+    def _on_header_context_menu(self, global_pos) -> None:
+        if not self._expanded:
+            return
+
+        local_val = self._get_local_az_sort()
+        effective_az = local_val if local_val is not None else self._global_az_sort
+
+        menu = QMenu(self)
+        menu.setObjectName("cardMenu")
+
+        # Label shows the CURRENT state (what is active right now):
+        # "A-Z Sort"      → currently sorting A-Z  (local=true OR no local + global=true)
+        # "Standard Sort" → currently standard sort (local=false OR no local + global=false)
+        if effective_az:
+            sort_act = menu.addAction("A-Z Sort")
+        else:
+            sort_act = menu.addAction("Standard Sort")
+
+        chosen = menu.exec(global_pos)
+        if chosen is sort_act:
+            self._toggle_az_sort(effective_az)
 
     def add_card(
         self, name: str, value: str, notes_file: Path, panel: "NotePanel"
@@ -3907,12 +3994,18 @@ class NotePanel(QScrollArea):
 
         all_entries = _flatten_notes(data, query)
 
-        # Apply A-Z sort within each folder when the flag is enabled
-        if az_sort:
-            all_entries.sort(key=lambda e: (e["category"].lower(), e["name"].lower()))
-
+        # ── Split entries into root vs. folder ────────────────────────────
+        # Root entries (no category) are sorted by the global az_sort flag.
+        # Folder entries keep their original JSON insertion order here; each
+        # folder's cards are sorted individually below using that folder's
+        # effective sort setting (local override → global fallback).
+        # The global pre-sort must NOT touch folder entries, because it would
+        # bake in A-Z order and make a local "Standard sort" override invisible.
         root_entries = [e for e in all_entries if not e["category"]]
         other_entries = [e for e in all_entries if e["category"]]
+
+        if az_sort:
+            root_entries.sort(key=lambda e: e["name"].lower())
 
         # ── Root entries (no category) shown at top as flat card grid ────
         if root_entries:
@@ -3952,7 +4045,14 @@ class NotePanel(QScrollArea):
                 parts = folder_path.split("/")
                 depth = len(parts)
                 title = parts[-1]
-                sec = NoteSection(title, depth=depth - 1)
+                sec = NoteSection(
+                    title,
+                    depth=depth - 1,
+                    notes_file=self._notes_file,
+                    category_path=folder_path,
+                    global_az_sort=az_sort,
+                    panel=self,
+                )
                 sections[folder_path] = sec
 
                 if depth == 1:
@@ -3964,12 +4064,23 @@ class NotePanel(QScrollArea):
                     else:
                         self._layout.addWidget(sec)
 
+            # Group entries by category, then apply per-folder sort before adding
+            from collections import defaultdict
+            by_cat: dict[str, list[dict]] = defaultdict(list)
             for entry in other_entries:
-                cat = entry["category"]
-                if cat in sections:
-                    sections[cat].add_card(
-                        entry["name"], entry["value"], self._notes_file, self
-                    )
+                by_cat[entry["category"]].append(entry)
+
+            for folder_path, sec in sections.items():
+                entries = by_cat.get(folder_path, [])
+                if not entries:
+                    continue
+                # Check for a local A-Z Sort override in this folder's dict
+                local_val = sec._get_local_az_sort()
+                effective = local_val if local_val is not None else az_sort
+                if effective:
+                    entries = sorted(entries, key=lambda e: e["name"].lower())
+                for entry in entries:
+                    sec.add_card(entry["name"], entry["value"], self._notes_file, self)
 
         self._layout.addStretch()
 
