@@ -227,6 +227,39 @@ def _save_scripts(scripts: list[dict]) -> None:
         pass
 
 
+# ── Modules ────────────────────────────────────────────────────────────────────
+# Modules are user scripts stored in any location (typically a local `modules/`
+# folder).  Unlike startup scripts they are NOT run at startup.  Instead they
+# are launched on demand when the user picks them from the Modules button menu.
+# Each module receives a JSON context blob via --_ctx <json> so it can read
+# live app state (active DB name, root folder, …) without importing the app.
+#
+# Persistence: ~/.asset_indexer/modules.json   [{name, path, args}, …]
+# ──────────────────────────────────────────────────────────────────────────────
+
+MODULES_FILE = APP_DIR / "modules.json"
+
+
+def _load_modules() -> list[dict]:
+    """Return list of {name, path, args} dicts for connected modules."""
+    try:
+        if MODULES_FILE.exists():
+            data = json.loads(MODULES_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return data
+    except Exception:
+        pass
+    return []
+
+
+def _save_modules(modules: list[dict]) -> None:
+    try:
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        MODULES_FILE.write_text(json.dumps(modules, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
 # ── Pixmap Cache ───────────────────────────────────────────────────────────────
 
 _PIXMAP_CACHE: dict[str, QPixmap] = {}
@@ -1853,6 +1886,8 @@ class FolderSection(QWidget):
         add_tag_act = menu.addAction("Add Tag")
         menu.addSeparator()
         edit_json_act = menu.addAction("Edit JSON...")
+        menu.addSeparator()
+        explorer_act = menu.addAction("Explorer")
 
         chosen = menu.exec(global_pos)
         if chosen is None:
@@ -1861,6 +1896,23 @@ class FolderSection(QWidget):
             self._add_folder_tag()
         elif chosen is edit_json_act:
             self._edit_folder_json()
+        elif chosen is explorer_act:
+            self._open_in_explorer()
+
+    def _open_in_explorer(self) -> None:
+        """Open this folder's directory in the OS file manager."""
+        folder_dir = self._get_folder_dir()
+        if folder_dir is None or not folder_dir.exists():
+            QMessageBox.warning(self, APP_NAME, "Could not locate folder on disk.")
+            return
+        path_str = str(folder_dir)
+        try:
+            if sys.platform == "win32":
+                subprocess.Popen(["explorer", path_str])
+            else:
+                subprocess.Popen(["xdg-open", path_str])
+        except Exception as exc:
+            QMessageBox.critical(self, APP_NAME, f"Could not open Explorer:\n{exc}")
 
     def _get_folder_dir(self) -> Optional[Path]:
         """Return the actual filesystem directory for this folder section."""
@@ -2055,11 +2107,21 @@ class ResultsPanel(QScrollArea):
         self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
 
     def set_db(
-        self, db: Optional[Database], root_folder: Optional[Path] = None
+        self,
+        db: Optional[Database],
+        root_folder: Optional[Path] = None,
+        restore_keys: Optional[set[str]] = None,
+        restore_scroll: int = 0,
     ) -> None:
         self._db = db
         self._root_folder = root_folder
-        self.refresh()
+        # set_db is only called internally by _set_active_db; the actual
+        # refresh with restore state is triggered by _do_search immediately
+        # after, so we just store the db/folder here without re-populating.
+        # (Calling refresh() here would populate once without restore state,
+        # and then _do_search would populate a second time correctly - wasteful.)
+        # For the initial startup path where _do_search follows immediately,
+        # this is fine.  We rely on _do_search to do the real render.
 
     def refresh(
         self,
@@ -2859,7 +2921,366 @@ class StartupScriptsDialog(_DraggableDialog):
 
 
 
-# ── Image Viewer Overlay ───────────────────────────────────────────────────────
+# ── Add Module Dialog ──────────────────────────────────────────────────────────
+
+
+class AddModuleDialog(_DraggableDialog):
+    """Frameless dialog for connecting a new module script."""
+
+    _PREFS_KEY = "add_module_pos"
+    W, H = 340, 262
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.module_path: str = ""
+        self.module_args: str = ""
+        self.module_name: str = ""
+        self.setWindowTitle("Connect Module")
+        self.setModal(True)
+        self.setFixedSize(self.W, self.H)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        shadow_frame = QFrame(self)
+        shadow_frame.setObjectName("dialogShadow")
+        shadow_frame.setGeometry(4, 4, self.W - 4, self.H - 4)
+
+        frame = QFrame(self)
+        frame.setObjectName("editDialogFrame")
+        frame.setGeometry(0, 0, self.W - 4, self.H - 4)
+
+        lay = QVBoxLayout(frame)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        # Header
+        header = QWidget()
+        header.setObjectName("editDialogHeader")
+        header.setFixedHeight(26)
+        h_lay = QHBoxLayout(header)
+        h_lay.setContentsMargins(14, 0, 10, 0)
+        h_lay.setSpacing(8)
+        dot = QWidget()
+        dot.setObjectName("editDialogDot")
+        dot.setFixedSize(6, 6)
+        title_lbl = QLabel("Connect Module")
+        title_lbl.setObjectName("editDialogTitle")
+        close_btn = QToolButton()
+        close_btn.setText("✕")
+        close_btn.setObjectName("dbDialogClose")
+        close_btn.setFixedSize(18, 18)
+        close_btn.clicked.connect(self.reject)
+        h_lay.addWidget(dot)
+        h_lay.addWidget(title_lbl)
+        h_lay.addStretch()
+        h_lay.addWidget(close_btn)
+        lay.addWidget(header)
+
+        sep = QFrame()
+        sep.setObjectName("dbDialogSep")
+        sep.setFrameShape(QFrame.Shape.HLine)
+        lay.addWidget(sep)
+
+        # Body
+        body = QWidget()
+        b_lay = QVBoxLayout(body)
+        b_lay.setContentsMargins(14, 10, 14, 8)
+        b_lay.setSpacing(8)
+
+        notice = QLabel("Module scripts receive live app context at launch via --_ctx.")
+        notice.setObjectName("scriptNotice")
+        notice.setWordWrap(True)
+        b_lay.addWidget(notice)
+
+        self._path_btn = QPushButton("Select Module Script...")
+        self._path_btn.setObjectName("editSaveBtn")
+        self._path_btn.clicked.connect(self._pick_module)
+        b_lay.addWidget(self._path_btn)
+
+        self._name_edit = QLineEdit()
+        self._name_edit.setObjectName("scriptArgsEdit")
+        self._name_edit.setPlaceholderText("Module name  (auto-filled from filename)")
+        self._name_edit.setFixedHeight(24)
+        b_lay.addWidget(self._name_edit)
+
+        self._args_edit = QLineEdit()
+        self._args_edit.setObjectName("scriptArgsEdit")
+        self._args_edit.setPlaceholderText(
+            "Extra arguments  (e.g. --output C:/some/folder)"
+        )
+        self._args_edit.setFixedHeight(24)
+        b_lay.addWidget(self._args_edit)
+
+        b_lay.addStretch()
+        lay.addWidget(body, 1)
+
+        sep2 = QFrame()
+        sep2.setObjectName("dbDialogSep")
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        lay.addWidget(sep2)
+
+        footer = QWidget()
+        footer.setObjectName("editDialogFooter")
+        f_lay = QHBoxLayout(footer)
+        f_lay.setContentsMargins(10, 5, 10, 6)
+        f_lay.setSpacing(0)
+        add_btn = QPushButton("Connect")
+        add_btn.setObjectName("editSaveBtn")
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setObjectName("editCancelBtn")
+        f_lay.addWidget(add_btn)
+        f_lay.addStretch()
+        f_lay.addWidget(cancel_btn)
+        lay.addWidget(footer)
+
+        add_btn.clicked.connect(self._accept)
+        cancel_btn.clicked.connect(self.reject)
+        self._restore_pos()
+
+    def _pick_module(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Module Script", "", "Python Scripts (*.py)"
+        )
+        if path:
+            self.module_path = path
+            self._path_btn.setText(Path(path).name)
+            if not self._name_edit.text().strip():
+                self._name_edit.setText(Path(path).stem)
+
+    def _accept(self) -> None:
+        if not self.module_path:
+            QMessageBox.warning(self, APP_NAME, "Please select a module script first.")
+            return
+        self.module_name = self._name_edit.text().strip() or Path(self.module_path).stem
+        self.module_args = self._args_edit.text().strip()
+        self.accept()
+
+
+# ── Modules Manager Dialog ─────────────────────────────────────────────────────
+
+
+class ModulesDialog(_DraggableDialog):
+    """Frameless dialog for managing connected module scripts.
+
+    Mirrors StartupScriptsDialog in structure; modules are stored in
+    ~/.asset_indexer/modules.json.
+    """
+
+    _PREFS_KEY = "modules_dialog_pos"
+    W, H = 280, 340
+
+    def __init__(self, parent=None, readonly: bool = False):
+        super().__init__(parent)
+        self._save_modules_fn = (lambda _m: None) if readonly else _save_modules
+
+        self.setWindowTitle(
+            "Connected Modules" + ("  [dev - changes not saved]" if readonly else "")
+        )
+        self.setModal(True)
+        self.setFixedSize(self.W, self.H)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        self._modules: list[dict] = _load_modules()
+
+        shadow_frame = QFrame(self)
+        shadow_frame.setObjectName("dialogShadow")
+        shadow_frame.setGeometry(4, 4, self.W - 4, self.H - 4)
+
+        frame = QFrame(self)
+        frame.setObjectName("editDialogFrame")
+        frame.setGeometry(0, 0, self.W - 4, self.H - 4)
+
+        lay = QVBoxLayout(frame)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        # Header
+        header = QWidget()
+        header.setObjectName("editDialogHeader")
+        header.setFixedHeight(26)
+        h_lay = QHBoxLayout(header)
+        h_lay.setContentsMargins(14, 0, 10, 0)
+        h_lay.setSpacing(8)
+        dot = QWidget()
+        dot.setObjectName("editDialogDot")
+        dot.setFixedSize(6, 6)
+        title_lbl = QLabel("Connected Modules")
+        title_lbl.setObjectName("editDialogTitle")
+        close_btn = QToolButton()
+        close_btn.setText("✕")
+        close_btn.setObjectName("dbDialogClose")
+        close_btn.setFixedSize(18, 18)
+        close_btn.clicked.connect(self.reject)
+        h_lay.addWidget(dot)
+        h_lay.addWidget(title_lbl)
+        h_lay.addStretch()
+        h_lay.addWidget(close_btn)
+        lay.addWidget(header)
+
+        sep = QFrame()
+        sep.setObjectName("dbDialogSep")
+        sep.setFrameShape(QFrame.Shape.HLine)
+        lay.addWidget(sep)
+
+        # List
+        list_wrap = QWidget()
+        list_wrap.setObjectName("dbListWrap")
+        lw_lay = QVBoxLayout(list_wrap)
+        lw_lay.setContentsMargins(8, 6, 8, 4)
+        lw_lay.setSpacing(0)
+        self._list = QListWidget()
+        self._list.setObjectName("dbDialogList")
+        self._list.setFrameShape(QFrame.Shape.NoFrame)
+        self._list.currentRowChanged.connect(self._on_selection_changed)
+        lw_lay.addWidget(self._list)
+        lay.addWidget(list_wrap, 1)
+        self._refresh_list()
+
+        sep2 = QFrame()
+        sep2.setObjectName("dbDialogSep")
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        lay.addWidget(sep2)
+
+        # Footer buttons
+        footer = QWidget()
+        footer.setObjectName("editDialogFooter")
+        f_lay = QHBoxLayout(footer)
+        f_lay.setContentsMargins(10, 6, 10, 7)
+        f_lay.setSpacing(6)
+
+        self._up_btn = QToolButton()
+        self._up_btn.setText("↑")
+        self._up_btn.setObjectName("scriptOrderBtn")
+        self._up_btn.setFixedSize(22, 22)
+        self._up_btn.setToolTip("Move Up")
+        self._up_btn.setEnabled(False)
+        self._up_btn.clicked.connect(self._move_up)
+
+        self._down_btn = QToolButton()
+        self._down_btn.setText("↓")
+        self._down_btn.setObjectName("scriptOrderBtn")
+        self._down_btn.setFixedSize(22, 22)
+        self._down_btn.setToolTip("Move Down")
+        self._down_btn.setEnabled(False)
+        self._down_btn.clicked.connect(self._move_down)
+
+        self._edit_btn = QToolButton()
+        self._edit_btn.setText("Edit")
+        self._edit_btn.setObjectName("scriptEditBtn")
+        self._edit_btn.setFixedSize(48, 20)
+        self._edit_btn.setToolTip("Edit Module")
+        self._edit_btn.setEnabled(False)
+        self._edit_btn.clicked.connect(self._edit_module)
+
+        self._add_btn = QToolButton()
+        self._add_btn.setText("+")
+        self._add_btn.setObjectName("scriptAddBtn")
+        self._add_btn.setFixedSize(22, 22)
+        self._add_btn.setToolTip("Connect Module")
+        self._add_btn.clicked.connect(self._add_module)
+
+        self._remove_btn = QToolButton()
+        self._remove_btn.setText("−")
+        self._remove_btn.setObjectName("scriptRemoveBtn")
+        self._remove_btn.setFixedSize(22, 22)
+        self._remove_btn.setToolTip("Disconnect Module")
+        self._remove_btn.setEnabled(False)
+        self._remove_btn.clicked.connect(self._remove_module)
+
+        f_lay.addStretch()
+        f_lay.addWidget(self._up_btn)
+        f_lay.addWidget(self._down_btn)
+        f_lay.addSpacing(8)
+        f_lay.addWidget(self._edit_btn)
+        f_lay.addSpacing(8)
+        f_lay.addWidget(self._add_btn)
+        f_lay.addWidget(self._remove_btn)
+        f_lay.addStretch()
+        lay.addWidget(footer)
+
+        self._restore_pos()
+
+    def _refresh_list(self) -> None:
+        row = self._list.currentRow()
+        self._list.clear()
+        for m in self._modules:
+            self._list.addItem(m["name"])
+        if 0 <= row < self._list.count():
+            self._list.setCurrentRow(row)
+
+    def _on_selection_changed(self, row: int) -> None:
+        has = row >= 0
+        count = len(self._modules)
+        self._remove_btn.setEnabled(has)
+        self._edit_btn.setEnabled(has)
+        self._up_btn.setEnabled(has and row > 0)
+        self._down_btn.setEnabled(has and row < count - 1)
+
+    def _edit_module(self) -> None:
+        row = self._list.currentRow()
+        if row < 0:
+            return
+        entry = self._modules[row]
+        dlg = AddModuleDialog(self)
+        dlg.setWindowTitle("Edit Module")
+        dlg.module_path = entry["path"]
+        dlg._path_btn.setText(
+            Path(entry["path"]).name if entry["path"] else "Select Module Script..."
+        )
+        dlg._name_edit.setText(entry.get("name", ""))
+        dlg._args_edit.setText(entry.get("args", ""))
+        if dlg.exec():
+            self._modules[row] = {
+                "name": dlg.module_name,
+                "path": dlg.module_path,
+                "args": dlg.module_args,
+            }
+            self._save_modules_fn(self._modules)
+            self._refresh_list()
+            self._list.setCurrentRow(row)
+
+    def _add_module(self) -> None:
+        dlg = AddModuleDialog(self)
+        if dlg.exec():
+            entry = {
+                "name": dlg.module_name,
+                "path": dlg.module_path,
+                "args": dlg.module_args,
+            }
+            self._modules.append(entry)
+            self._save_modules_fn(self._modules)
+            self._refresh_list()
+            self._list.setCurrentRow(len(self._modules) - 1)
+
+    def _remove_module(self) -> None:
+        row = self._list.currentRow()
+        if row >= 0:
+            del self._modules[row]
+            self._save_modules_fn(self._modules)
+            self._refresh_list()
+
+    def _move_up(self) -> None:
+        row = self._list.currentRow()
+        if row > 0:
+            self._modules[row - 1], self._modules[row] = (
+                self._modules[row],
+                self._modules[row - 1],
+            )
+            self._save_modules_fn(self._modules)
+            self._refresh_list()
+            self._list.setCurrentRow(row - 1)
+
+    def _move_down(self) -> None:
+        row = self._list.currentRow()
+        if row < len(self._modules) - 1:
+            self._modules[row], self._modules[row + 1] = (
+                self._modules[row + 1],
+                self._modules[row],
+            )
+            self._save_modules_fn(self._modules)
+            self._refresh_list()
+            self._list.setCurrentRow(row + 1)
 
 
 class ImgViewerOverlay(QWidget):
@@ -3099,8 +3520,9 @@ class MainWindow(QMainWindow):
         self._index_worker: Optional[IndexWorker] = None
         self._pre_search_expanded: Optional[set[str]] = None
         self._pre_search_scroll: int = 0
+        self._reload_restore_keys: Optional[set[str]] = None
+        self._reload_restore_scroll: int = 0
         self._script_runner: Optional[ScriptRunner] = None
-        self._note_window: Optional[NoteWindow] = None
         self._img_viewer: Optional[ImgViewerOverlay] = None
 
         # ── DEV MODE: create the in-memory stub database once here.
@@ -3145,13 +3567,19 @@ class MainWindow(QMainWindow):
         top_row.addWidget(self._menu_btn)
         top_row.addWidget(self._search, 1)
 
-        self._note_btn = QToolButton()
-        self._note_btn.setText("\uf249")
-        self._note_btn.setObjectName("noteBtn")
-        self._note_btn.setFixedSize(26, 26)
-        self._note_btn.setToolTip("Notes")
-        self._note_btn.clicked.connect(self._open_note_window)
-        top_row.addWidget(self._note_btn)
+        self._module_btn = QToolButton()
+        self._module_btn.setText("\u2318")
+        self._module_btn.setObjectName("moduleBtn")
+        self._module_btn.setFixedSize(26, 26)
+        self._module_btn.setToolTip("Modules")
+        self._module_btn.clicked.connect(self._open_modules_menu)
+        _mod_font = self._module_btn.font()
+        _mod_font.setFamily("Segoe UI Symbol")
+        _mod_font.setPointSize(11)
+        self._module_btn.setFont(_mod_font)
+        top_row.addWidget(self._module_btn)
+
+
 
         outer.addLayout(top_row)
 
@@ -3243,7 +3671,12 @@ class MainWindow(QMainWindow):
         target = last if last in names else names[0]
         self._start_load_db(target)
 
-    def _set_active_db(self, name: str) -> None:
+    def _set_active_db(
+        self,
+        name: str,
+        restore_keys: Optional[set[str]] = None,
+        restore_scroll: int = 0,
+    ) -> None:
         self._active_db = name
         self._db_lbl.setText(name or "-")
         # ── DEV MODE: never overwrite last_db - user's real session must survive
@@ -3253,15 +3686,26 @@ class MainWindow(QMainWindow):
             _save_prefs(prefs)
         db = self.db_manager.get(name) if name else None
         root_folder = self.db_manager.root_for(name) if name else None
-        self._results.set_db(db, root_folder)
-        self._do_search()
+        self._results.set_db(db, root_folder, restore_keys=restore_keys, restore_scroll=restore_scroll)
+        self._do_search(restore_keys=restore_keys, restore_scroll=restore_scroll)
 
-    def _start_load_db(self, name: str, full_rebuild: bool = False) -> None:
+    def _start_load_db(
+        self,
+        name: str,
+        full_rebuild: bool = False,
+        restore_keys: Optional[set[str]] = None,
+        restore_scroll: int = 0,
+    ) -> None:
         """Begin background indexing for a database, showing the loading overlay.
 
         On a normal (non-rebuild) startup the file cache is diffed first so only
         changed/added/deleted files are re-indexed.  If no files changed at all
         the worker is skipped entirely.  full_rebuild bypasses the cache.
+
+        restore_keys / restore_scroll: when set, the expanded-folder state and
+        scroll position captured *before* the reload are reapplied after the
+        index finishes, so a reload feels like a transparent refresh rather than
+        a full reset.
         """
         if self._index_worker and self._index_worker.isRunning():
             return  # already busy
@@ -3279,10 +3723,10 @@ class MainWindow(QMainWindow):
             self._results.hide_loading()
             self._search.setEnabled(True)
             self._menu_btn.setEnabled(True)
-            self._set_active_db(name)
+            self._set_active_db(name, restore_keys=restore_keys, restore_scroll=restore_scroll)
             return
 
-        # ── Cache diff (skipped on full rebuild) ─────────────────────────────────────────
+        # ── Cache diff (skipped on full rebuild) ──────────────────────────────
         flagged: Optional[tuple[set[str], set[str], set[str]]] = None
         if not full_rebuild:
             cache = _load_file_cache(name)
@@ -3298,7 +3742,7 @@ class MainWindow(QMainWindow):
                     self._results.hide_loading()
                     self._search.setEnabled(True)
                     self._menu_btn.setEnabled(True)
-                    self._set_active_db(name)
+                    self._set_active_db(name, restore_keys=restore_keys, restore_scroll=restore_scroll)
                     db_total = db.count()
                     self._set_status(f"{db_total} assets (no changes)")
                     return
@@ -3307,7 +3751,8 @@ class MainWindow(QMainWindow):
         worker = IndexWorker(db.path, folder, full_rebuild=full_rebuild, flagged=flagged)
         worker.progress.connect(self._on_index_progress)
         worker.finished.connect(
-            lambda total, n=name, rb=full_rebuild: self._on_index_finished(n, total, rb)
+            lambda total, n=name, rb=full_rebuild, rk=restore_keys, rs=restore_scroll:
+                self._on_index_finished(n, total, rb, rk, rs)
         )
         self._index_worker = worker
         worker.start()
@@ -3316,27 +3761,85 @@ class MainWindow(QMainWindow):
         self._results.update_loading(msg)
         self._set_status(msg)
 
-    def _on_index_finished(self, name: str, total: int, full_rebuild: bool = False) -> None:
+    def _on_index_finished(
+        self,
+        name: str,
+        total: int,
+        full_rebuild: bool = False,
+        restore_keys: Optional[set[str]] = None,
+        restore_scroll: int = 0,
+    ) -> None:
         # Don't hide the overlay yet - _set_active_db → refresh() will show
         # "Rendering..." and hide the overlay once _populate() completes.
         self._search.setEnabled(True)
         self._menu_btn.setEnabled(True)
-        self._set_active_db(name)
+        self._set_active_db(name, restore_keys=restore_keys, restore_scroll=restore_scroll)
         self._set_status(f"{total} assets")
         self._index_worker = None
 
-        # ── Write updated file cache after a successful index ───────────────────
+        # ── Write updated file cache after a successful index ──────────────────
         # Rebuild the cache from disk so it reflects the current state exactly.
         # Runs in the main thread after indexing; the rglob is stat-only (fast).
         folder = self.db_manager.root_for(name)
         if folder is not None and folder.exists():
+            # ── Evict stale pixmaps before re-rendering ────────────────────────
+            # If the user replaced one or more images on disk, the old scaled
+            # pixmaps must be removed from _PIXMAP_CACHE so the next _populate()
+            # call loads the fresh files instead of the outdated cached versions.
+            old_cache = _load_file_cache(name)
+            if old_cache:
+                _, changed_paths, deleted_paths = _diff_against_cache(folder, old_cache)
+                for path in changed_paths | deleted_paths:
+                    _PIXMAP_CACHE.pop(path, None)
+
             new_cache = _build_file_cache(folder)
             _save_file_cache(name, new_cache)
 
-    def _open_note_window(self) -> None:
-        if self._note_window is None:
-            self._note_window = NoteWindow(self)
-        self._note_window.show_and_reload()
+    def _open_modules_menu(self) -> None:
+        """Show a popup menu listing all connected modules; clicking one launches it."""
+        modules = _load_modules()
+        menu = QMenu(self)
+        if not modules:
+            action = menu.addAction("No modules connected")
+            action.setEnabled(False)
+            menu.addSeparator()
+            menu.addAction("Connect Modules…", self._action_modules)
+        else:
+            for entry in modules:
+                name = entry.get("name", "Unnamed Module")
+                def _make_launcher(e):
+                    return lambda: self._launch_module(e)
+                menu.addAction(name, _make_launcher(entry))
+            menu.addSeparator()
+            menu.addAction("Manage Modules…", self._action_modules)
+        menu.exec(self._module_btn.mapToGlobal(self._module_btn.rect().bottomLeft()))
+
+    def _launch_module(self, entry: dict) -> None:
+        """Launch a module script, injecting a JSON context blob via --_ctx."""
+        import json as _json
+
+        db = self.db_manager.get(self._active_db) if self._active_db else None
+        root_folder = self.db_manager.root_for(self._active_db) if self._active_db else None
+        ctx = {
+            "active_db": self._active_db or "",
+            "db_path": str(db.path) if db else "",
+            "root_folder": str(root_folder) if root_folder else "",
+            "app_dir": str(APP_DIR),
+            "dev_mode": DEV_MODE,
+        }
+        ctx_json = _json.dumps(ctx)
+        cmd = f'python "{entry["path"]}"'
+        if entry.get("args", "").strip():
+            cmd += f" {entry['args'].strip()}"
+        cmd += f" --_ctx {_json.dumps(ctx_json)}"
+        try:
+            subprocess.Popen(cmd, shell=True)
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                APP_NAME,
+                f"Failed to launch module '{entry.get('name', '')}'\n\n{exc}",
+            )
 
     def _on_search_text_changed(self) -> None:
         text = self._search.text().strip()
@@ -3348,7 +3851,11 @@ class MainWindow(QMainWindow):
 
         self._search_timer.start()  # restart the 1-second debounce window
 
-    def _do_search(self) -> None:
+    def _do_search(
+        self,
+        restore_keys: Optional[set[str]] = None,
+        restore_scroll: int = 0,
+    ) -> None:
         self._search_timer.stop()
         text = self._search.text().strip()
 
@@ -3369,6 +3876,14 @@ class MainWindow(QMainWindow):
             )
             self._pre_search_expanded = None
             self._pre_search_scroll = 0
+        elif restore_keys is not None:
+            # Reload path: explicit restore state was passed in from _set_active_db
+            self._results.refresh(
+                effective_text,
+                folder_only=folder_only,
+                restore_keys=restore_keys,
+                restore_scroll=restore_scroll,
+            )
         else:
             self._results.refresh(effective_text, folder_only=folder_only)
 
@@ -3394,6 +3909,7 @@ class MainWindow(QMainWindow):
         menu.addAction("Change Database", self._action_open_db)
         menu.addAction("Add Folder", self._action_add_folder)
         menu.addAction("Startup Scripts", self._action_startup_scripts)
+        menu.addAction("Connected Modules", self._action_modules)
         menu.aboutToHide.connect(self._on_menu_hide)
         self._app_menu = menu
         menu.exec(self._menu_btn.mapToGlobal(self._menu_btn.rect().bottomLeft()))
@@ -3409,7 +3925,14 @@ class MainWindow(QMainWindow):
             self._do_search()
             return
         if self._active_db:
-            self._start_load_db(self._active_db)
+            # Snapshot current UI state so it survives the reload
+            restore_keys = self._results._get_expanded_keys()
+            restore_scroll = self._results.verticalScrollBar().value()
+            self._start_load_db(
+                self._active_db,
+                restore_keys=restore_keys,
+                restore_scroll=restore_scroll,
+            )
 
     def _action_reload_with_scripts(self) -> None:
         """Run startup scripts first, then reload the active database."""
@@ -3419,11 +3942,20 @@ class MainWindow(QMainWindow):
             self._results.set_db(self._dev_db)  # type: ignore[arg-type]
             self._do_search()
             return
+
+        # Snapshot current UI state *before* the loading overlay covers everything
+        self._reload_restore_keys = self._results._get_expanded_keys()
+        self._reload_restore_scroll = self._results.verticalScrollBar().value()
+
         scripts = _load_scripts()
         if not scripts:
             # No scripts configured - fall back to a plain reload
             if self._active_db:
-                self._start_load_db(self._active_db)
+                self._start_load_db(
+                    self._active_db,
+                    restore_keys=self._reload_restore_keys,
+                    restore_scroll=self._reload_restore_scroll,
+                )
             return
 
         self._results.show_loading(f"Executing Startup Scripts (1/{len(scripts)})")
@@ -3442,7 +3974,11 @@ class MainWindow(QMainWindow):
         self._search.setEnabled(True)
         self._menu_btn.setEnabled(True)
         if self._active_db:
-            self._start_load_db(self._active_db)
+            self._start_load_db(
+                self._active_db,
+                restore_keys=getattr(self, "_reload_restore_keys", None),
+                restore_scroll=getattr(self, "_reload_restore_scroll", 0),
+            )
 
     def _action_open_db(self) -> None:
         dlg = OpenDatabaseDialog(self.db_manager, self._active_db, self)
@@ -3469,6 +4005,12 @@ class MainWindow(QMainWindow):
         #    nothing is written to disk. Changes are lost on close.
         dlg = StartupScriptsDialog(self, readonly=DEV_MODE)
         dlg.exec()
+
+    def _action_modules(self) -> None:
+        """Open the Connected Modules manager dialog."""
+        dlg = ModulesDialog(self, readonly=DEV_MODE)
+        dlg.exec()
+
 
     # ── Resize: keep overlay filling the central widget ──────────────────
 
@@ -3499,840 +4041,6 @@ class MainWindow(QMainWindow):
         # Clear pixmap cache to release file handles
         _PIXMAP_CACHE.clear()
         super().closeEvent(event)
-
-
-# ── Notes helpers ──────────────────────────────────────────────────────────────
-
-
-def _load_notes() -> dict:
-    try:
-        if NOTES_FILE.exists():
-            return json.loads(NOTES_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return {}
-
-
-def _save_notes(data: dict) -> None:
-    try:
-        APP_DIR.mkdir(parents=True, exist_ok=True)
-        NOTES_FILE.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-    except Exception:
-        pass
-
-
-_AZ_SORT_KEY = "A-Z Sort in Folder"
-
-
-def _ensure_az_sort_flag(data: dict) -> dict:
-    """Check for the 'A-Z Sort in Folder' flag at the root of the notes JSON.
-
-    - If the key is missing it is inserted at the very top (position 0) with
-      value True and the file is saved immediately.
-    - If the key already exists its value is left unchanged.
-    - Returns the (possibly updated) data dict.
-    """
-    if _AZ_SORT_KEY not in data:
-        # Insert at the very top by rebuilding the dict with the flag first
-        updated = {_AZ_SORT_KEY: True}
-        updated.update(data)
-        _save_notes(updated)
-        return updated
-    return data
-
-
-def _flatten_notes(data: dict, query: str = "", category_path: str = "") -> list[dict]:
-    """Recursively flatten notes JSON into {name, value, category} dicts.
-
-    The 'A-Z Sort in Folder' key is a control flag, not a user entry; it is
-    silently skipped at every level so it never appears as a copyable card.
-    """
-    results: list[dict] = []
-    for key, value in data.items():
-        if key == _AZ_SORT_KEY:
-            continue  # internal flag – never shown as a card
-        if isinstance(value, str):
-            if not query or query.lower() in key.lower():
-                results.append({"name": key, "value": value, "category": category_path})
-        elif isinstance(value, dict):
-            sub = f"{category_path}/{key}" if category_path else key
-            results.extend(_flatten_notes(value, query, sub))
-    return results
-
-
-def _set_nested(data: dict, keys: list, name: str, value: str) -> None:
-    if not keys:
-        data[name] = value
-        return
-    k = keys[0]
-    if k not in data or not isinstance(data[k], dict):
-        data[k] = {}
-    _set_nested(data[k], keys[1:], name, value)
-
-
-def _add_note_entry(name: str, value: str, category: str) -> None:
-    data = _load_notes()
-    if category:
-        parts = [p for p in category.split("/") if p]
-        _set_nested(data, parts, name, value)
-    else:
-        data[name] = value
-    _save_notes(data)
-
-
-# ── Note Entry Card ────────────────────────────────────────────────────────────
-
-
-class NoteEntryCard(QWidget):
-    CARD_W = THUMB_W  # 106 px
-    CARD_H = 80  # 4:3 ratio  (106 × 3/4 ≈ 80)
-
-    def __init__(
-        self,
-        name: str,
-        value: str,
-        notes_file: Path,
-        panel: "NotePanel",
-        parent: Optional[QWidget] = None,
-    ):
-        super().__init__(parent)
-        self._name = name
-        self._value = value
-        self._notes_file = notes_file
-        self._panel = panel
-        self._flashing = False
-        self._flash_timer: Optional[QTimer] = None
-        self._hovered = False
-
-        self.setFixedSize(self.CARD_W, self.CARD_H)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setObjectName("noteEntry")
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(4, 4, 4, 4)
-        lay.setSpacing(0)
-
-        # Equal stretch=1 gives each label exactly half the card height.
-        # AlignBottom on Name keeps it visually near the centre-line from above;
-        # AlignTop on Value keeps it near the centre-line from below.
-        name_lbl = QLabel(name)
-        name_lbl.setObjectName("noteEntryName")
-        name_lbl.setAlignment(
-            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom
-        )
-        lay.addWidget(name_lbl, 1)
-
-        val_lbl = QLabel(value)
-        val_lbl.setObjectName("noteEntryValue")
-        val_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
-        lay.addWidget(val_lbl, 1)
-
-    def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._copy_value()
-        super().mousePressEvent(event)
-
-    def enterEvent(self, event) -> None:
-        self._hovered = True
-        self.update()
-        super().enterEvent(event)
-
-    def leaveEvent(self, event) -> None:
-        self._hovered = False
-        self.update()
-        super().leaveEvent(event)
-
-    def _copy_value(self) -> None:
-        QApplication.clipboard().setText(self._value)
-        self._flashing = True
-        self.update()
-        if self._flash_timer:
-            self._flash_timer.stop()
-        self._flash_timer = QTimer(self)
-        self._flash_timer.setSingleShot(True)
-        self._flash_timer.timeout.connect(self._end_flash)
-        self._flash_timer.start(350)
-
-    def _end_flash(self) -> None:
-        self._flashing = False
-        self._flash_timer = None
-        self.update()
-
-    def paintEvent(self, event) -> None:
-        from PySide6.QtGui import QPainterPath, QPen
-
-        super().paintEvent(event)
-        if self._flashing:
-            # Clicked: subtle green fill + border
-            p = QPainter(self)
-            p.setRenderHint(QPainter.RenderHint.Antialiasing)
-            p.setBrush(QColor(80, 200, 120, 28))
-            pen = QPen(QColor(80, 200, 120, 90))
-            pen.setWidth(2)
-            p.setPen(pen)
-            path = QPainterPath()
-            path.addRoundedRect(1, 1, self.CARD_W - 2, self.CARD_H - 2, 7, 7)
-            p.drawPath(path)
-            p.end()
-        elif self._hovered:
-            # Hover: very faint white/neutral tint
-            p = QPainter(self)
-            p.setRenderHint(QPainter.RenderHint.Antialiasing)
-            p.setBrush(QColor(255, 255, 255, 10))
-            pen = QPen(QColor(255, 255, 255, 35))
-            pen.setWidth(1)
-            p.setPen(pen)
-            path = QPainterPath()
-            path.addRoundedRect(1, 1, self.CARD_W - 2, self.CARD_H - 2, 7, 7)
-            p.drawPath(path)
-            p.end()
-
-    def contextMenuEvent(self, event) -> None:
-        menu = QMenu(self)
-        menu.setObjectName("cardMenu")
-        copy_act = menu.addAction("Copy")
-        menu.addSeparator()
-        edit_act = menu.addAction("Edit Json")
-        chosen = menu.exec(event.globalPos())
-        if chosen is copy_act:
-            QApplication.clipboard().setText(self._value)
-        elif chosen is edit_act:
-            self._open_edit_json()
-
-    def _open_edit_json(self) -> None:
-        try:
-            raw = (
-                self._notes_file.read_text(encoding="utf-8")
-                if self._notes_file.exists()
-                else "{}"
-            )
-            raw = json.dumps(json.loads(raw), indent=2, ensure_ascii=False)
-        except Exception:
-            raw = "{}"
-        fake = {
-            "image_path": "",
-            "json_path": str(self._notes_file),
-            "json_data": raw,
-            "name": "notes",
-        }
-        dlg = EditJsonDialog(fake, None, self, focus_key=self._name)
-        if dlg.exec():
-            self._panel.reload()
-
-
-# ── Note Section ───────────────────────────────────────────────────────────────
-
-
-class NoteSection(QWidget):
-    def __init__(
-        self,
-        title: str,
-        depth: int = 0,
-        notes_file: Optional[Path] = None,
-        category_path: str = "",
-        global_az_sort: bool = True,
-        panel: Optional["NotePanel"] = None,
-        parent: Optional[QWidget] = None,
-    ):
-        super().__init__(parent)
-        self._expanded = False
-        self._depth = depth
-        self._child_sections: list["NoteSection"] = []
-        self._notes_file = notes_file
-        self._category_path = category_path   # e.g. "Animals/Dogs"
-        self._global_az_sort = global_az_sort
-        self._panel_ref: Optional["NotePanel"] = panel
-
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-
-        # ── Header ──────────────────────────────────────────────────────
-        header_container = QWidget()
-        header_container.setObjectName("sectionHeaderWrap")
-        hc_lay = QHBoxLayout(header_container)
-        indent = depth * 14
-        hc_lay.setContentsMargins(indent, 0, 0, 0)
-        hc_lay.setSpacing(4)
-
-        self._header = QToolButton()
-        self._header.setObjectName("sectionHeader")
-        self._header.setCheckable(False)
-        self._header.setArrowType(Qt.ArrowType.RightArrow)
-        self._header.setText(title)
-        self._header.setSizePolicy(
-            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed
-        )
-        self._header.setFixedHeight(24 if depth == 0 else 22)
-        self._header.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self._header.clicked.connect(self._toggle)
-        self._header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self._header.customContextMenuRequested.connect(
-            lambda pos: self._on_header_context_menu(self._header.mapToGlobal(pos))
-        )
-
-        hc_lay.addWidget(self._header)
-        hc_lay.addStretch()
-        outer.addWidget(header_container)
-
-        # ── Body ─────────────────────────────────────────────────────────
-        self._body = QWidget()
-        self._body.setObjectName("sectionBody")
-        self._body_lay = QVBoxLayout(self._body)
-        self._body_lay.setContentsMargins(indent + 8, 4, 4, 6)
-        self._body_lay.setSpacing(2)
-
-        self._card_widget = QWidget()
-        self._card_widget.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum
-        )
-        self._card_grid = QGridLayout(self._card_widget)
-        self._card_grid.setContentsMargins(0, 0, 0, 0)
-        self._card_grid.setSpacing(6)
-        self._card_grid.setAlignment(
-            Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft
-        )
-        self._body_lay.addWidget(self._card_widget)
-
-        self._body.setVisible(False)
-        outer.addWidget(self._body)
-
-        self._cards: list[NoteEntryCard] = []
-        self._current_cols: int = COLS
-
-    def _get_local_az_sort(self) -> Optional[bool]:
-        """Return folder-local 'A-Z Sort in Folder' from notes.json, or None if absent."""
-        if not self._notes_file or not self._notes_file.exists() or not self._category_path:
-            return None
-        try:
-            data = json.loads(self._notes_file.read_text(encoding="utf-8", errors="ignore"))
-            # Navigate to this folder's dict
-            parts = self._category_path.split("/")
-            node = data
-            for part in parts:
-                if not isinstance(node, dict) or part not in node:
-                    return None
-                node = node[part]
-            if isinstance(node, dict) and _AZ_SORT_KEY in node:
-                return bool(node[_AZ_SORT_KEY])
-        except Exception:
-            pass
-        return None
-
-    def _toggle_az_sort(self, current_effective: bool) -> None:
-        """Write the inverse of current_effective into this folder's dict in notes.json."""
-        if not self._notes_file or not self._category_path:
-            return
-        try:
-            data = (
-                json.loads(self._notes_file.read_text(encoding="utf-8", errors="ignore"))
-                if self._notes_file.exists()
-                else {}
-            )
-        except Exception:
-            data = {}
-
-        # Navigate to this folder's dict, preserving existing content at each level
-        parts = self._category_path.split("/")
-        node = data
-        for part in parts:
-            existing = node.get(part)
-            if not isinstance(existing, dict):
-                node[part] = {}
-            node = node[part]
-
-        node[_AZ_SORT_KEY] = not current_effective
-        _save_notes(data)
-
-        # Reload the panel so the new sort takes effect immediately
-        if self._panel_ref is not None:
-            self._panel_ref.reload(self._panel_ref._current_query)
-
-    def _on_header_context_menu(self, global_pos) -> None:
-        if not self._expanded:
-            return
-
-        local_val = self._get_local_az_sort()
-        effective_az = local_val if local_val is not None else self._global_az_sort
-
-        menu = QMenu(self)
-        menu.setObjectName("cardMenu")
-
-        # Label shows the CURRENT state (what is active right now):
-        # "A-Z Sort"      → currently sorting A-Z  (local=true OR no local + global=true)
-        # "Standard Sort" → currently standard sort (local=false OR no local + global=false)
-        if effective_az:
-            sort_act = menu.addAction("A-Z Sort")
-        else:
-            sort_act = menu.addAction("Standard Sort")
-
-        chosen = menu.exec(global_pos)
-        if chosen is sort_act:
-            self._toggle_az_sort(effective_az)
-
-    def add_card(
-        self, name: str, value: str, notes_file: Path, panel: "NotePanel"
-    ) -> None:
-        card = NoteEntryCard(name, value, notes_file, panel)
-        i = len(self._cards)
-        self._cards.append(card)
-        row = i // COLS
-        self._card_grid.addWidget(card, row, i % COLS)
-        self._card_grid.setRowMinimumHeight(row, 0)
-        self._card_grid.setRowStretch(row, 0)
-
-    def add_child_section(self, sec: "NoteSection") -> None:
-        self._child_sections.append(sec)
-        self._body_lay.addWidget(sec)
-
-    def _relayout_cards(self) -> None:
-        avail_w = self._card_widget.width()
-        if avail_w < NoteEntryCard.CARD_W:
-            return
-        cols = max(1, avail_w // (NoteEntryCard.CARD_W + 6))
-        if cols == self._current_cols:
-            return
-        self._current_cols = cols
-        while self._card_grid.count():
-            self._card_grid.takeAt(0)
-        for i, card in enumerate(self._cards):
-            self._card_grid.addWidget(card, i // cols, i % cols)
-        # Force each row to only be as tall as the card — no extra expansion
-        num_rows = (len(self._cards) + cols - 1) // cols
-        for r in range(num_rows):
-            self._card_grid.setRowMinimumHeight(r, 0)
-            self._card_grid.setRowStretch(r, 0)
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        if self._expanded and self._cards:
-            self._relayout_cards()
-
-    def _toggle(self) -> None:
-        self._expanded = not self._expanded
-        self._body.setVisible(self._expanded)
-        self._header.setArrowType(
-            Qt.ArrowType.DownArrow if self._expanded else Qt.ArrowType.RightArrow
-        )
-        if self._expanded and self._cards:
-            self._current_cols = 0
-            QTimer.singleShot(0, self._relayout_cards)
-
-
-# ── Note Panel ─────────────────────────────────────────────────────────────────
-
-
-class NotePanel(QScrollArea):
-    def __init__(self, notes_file: Path, parent: Optional[QWidget] = None):
-        super().__init__(parent)
-        self._notes_file = notes_file
-        self.setObjectName("resultsPanel")
-        self.setWidgetResizable(True)
-        self.setFrameShape(QFrame.Shape.NoFrame)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-
-        self._content = QWidget()
-        self._layout = QVBoxLayout(self._content)
-        self._layout.setContentsMargins(6, 6, 6, 6)
-        self._layout.setSpacing(1)
-        self._layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.setWidget(self._content)
-
-        self._current_query: str = ""
-
-    def _get_expanded_titles(self) -> set[str]:
-        """Recursively collect the title text of every expanded NoteSection."""
-        titles: set[str] = set()
-
-        def _collect(layout) -> None:
-            for i in range(layout.count()):
-                item = layout.itemAt(i)
-                if item is None:
-                    continue
-                w = item.widget()
-                if isinstance(w, NoteSection):
-                    if w._expanded:
-                        titles.add(w._header.text())
-                    _collect(w._body_lay)
-
-        _collect(self._layout)
-        return titles
-
-    def reload(self, query: str = "") -> None:
-        self._current_query = query
-        # Snapshot state before clearing so we can restore it after repopulating
-        expanded_titles = self._get_expanded_titles()
-        scroll_value = self.verticalScrollBar().value()
-        try:
-            data = (
-                json.loads(self._notes_file.read_text(encoding="utf-8"))
-                if self._notes_file.exists()
-                else {}
-            )
-        except Exception:
-            data = {}
-        # Ensure the A-Z Sort flag exists; inserts it at the top if missing
-        data = _ensure_az_sort_flag(data)
-        az_sort = bool(data.get(_AZ_SORT_KEY, True))
-        self._populate(data, query, expanded_titles, scroll_value, az_sort)
-
-    def _populate(
-        self,
-        data: dict,
-        query: str = "",
-        expanded_titles: set[str] | None = None,
-        scroll_value: int = 0,
-        az_sort: bool = True,
-    ) -> None:
-        # Clear layout
-        while self._layout.count():
-            item = self._layout.takeAt(0)
-            if item is not None and (w := item.widget()):
-                w.deleteLater()
-
-        all_entries = _flatten_notes(data, query)
-
-        # ── Split entries into root vs. folder ────────────────────────────
-        # Root entries (no category) are sorted by the global az_sort flag.
-        # Folder entries keep their original JSON insertion order here; each
-        # folder's cards are sorted individually below using that folder's
-        # effective sort setting (local override → global fallback).
-        # The global pre-sort must NOT touch folder entries, because it would
-        # bake in A-Z order and make a local "Standard sort" override invisible.
-        root_entries = [e for e in all_entries if not e["category"]]
-        other_entries = [e for e in all_entries if e["category"]]
-
-        if az_sort:
-            root_entries.sort(key=lambda e: e["name"].lower())
-
-        # ── Root entries (no category) shown at top as flat card grid ────
-        if root_entries:
-            root_widget = QWidget()
-            root_widget.setSizePolicy(
-                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum
-            )
-            root_grid = QGridLayout(root_widget)
-            root_grid.setContentsMargins(0, 2, 0, 6)
-            root_grid.setSpacing(6)
-            root_grid.setAlignment(
-                Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft
-            )
-            for i, entry in enumerate(root_entries):
-                card = NoteEntryCard(
-                    entry["name"], entry["value"], self._notes_file, self
-                )
-                root_grid.addWidget(card, i // COLS, i % COLS)
-            num_rows = (len(root_entries) + COLS - 1) // COLS
-            for r in range(num_rows):
-                root_grid.setRowMinimumHeight(r, 0)
-                root_grid.setRowStretch(r, 0)
-            self._layout.addWidget(root_widget)
-
-        # ── Folder sections for categorised entries ───────────────────────
-        if other_entries:
-            all_folder_paths: set[str] = set()
-            for e in other_entries:
-                parts = e["category"].split("/")
-                for depth in range(1, len(parts) + 1):
-                    all_folder_paths.add("/".join(parts[:depth]))
-
-            folder_list = sorted(all_folder_paths)
-            sections: dict[str, NoteSection] = {}
-
-            for folder_path in folder_list:
-                parts = folder_path.split("/")
-                depth = len(parts)
-                title = parts[-1]
-                sec = NoteSection(
-                    title,
-                    depth=depth - 1,
-                    notes_file=self._notes_file,
-                    category_path=folder_path,
-                    global_az_sort=az_sort,
-                    panel=self,
-                )
-                sections[folder_path] = sec
-
-                if depth == 1:
-                    self._layout.addWidget(sec)
-                else:
-                    parent_path = "/".join(parts[:-1])
-                    if parent_path in sections:
-                        sections[parent_path].add_child_section(sec)
-                    else:
-                        self._layout.addWidget(sec)
-
-            # Group entries by category, then apply per-folder sort before adding
-            from collections import defaultdict
-            by_cat: dict[str, list[dict]] = defaultdict(list)
-            for entry in other_entries:
-                by_cat[entry["category"]].append(entry)
-
-            for folder_path, sec in sections.items():
-                entries = by_cat.get(folder_path, [])
-                if not entries:
-                    continue
-                # Check for a local A-Z Sort override in this folder's dict
-                local_val = sec._get_local_az_sort()
-                effective = local_val if local_val is not None else az_sort
-                if effective:
-                    entries = sorted(entries, key=lambda e: e["name"].lower())
-                for entry in entries:
-                    sec.add_card(entry["name"], entry["value"], self._notes_file, self)
-
-        self._layout.addStretch()
-
-        # Re-open any section that was expanded before the refresh
-        if expanded_titles:
-
-            def _restore(layout) -> None:
-                for i in range(layout.count()):
-                    item = layout.itemAt(i)
-                    if item is None:
-                        continue
-                    w = item.widget()
-                    if (
-                        isinstance(w, NoteSection)
-                        and w._header.text() in expanded_titles
-                    ):
-                        if not w._expanded:
-                            w._toggle()
-                        _restore(w._body_lay)
-
-            _restore(self._layout)
-
-        # Restore scroll position after layout settles
-        if scroll_value:
-            QTimer.singleShot(
-                0, lambda: self.verticalScrollBar().setValue(scroll_value)
-            )
-
-
-# ── Create Note Dialog ─────────────────────────────────────────────────────────
-
-
-class CreateNoteDialog(_DraggableDialog):
-    _PREFS_KEY = "create_note_pos"
-    W, H = 310, 230
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setModal(True)
-        self.setFixedSize(self.W, self.H)
-        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-
-        shadow_frame = QFrame(self)
-        shadow_frame.setObjectName("dialogShadow")
-        shadow_frame.setGeometry(4, 4, self.W - 4, self.H - 4)
-
-        frame = QFrame(self)
-        frame.setObjectName("editDialogFrame")
-        frame.setGeometry(0, 0, self.W - 4, self.H - 4)
-
-        lay = QVBoxLayout(frame)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-
-        # ── Header ────────────────────────────────────────────────────────
-        header = QWidget()
-        header.setObjectName("editDialogHeader")
-        header.setFixedHeight(26)
-        h_lay = QHBoxLayout(header)
-        h_lay.setContentsMargins(14, 0, 10, 0)
-        h_lay.setSpacing(8)
-
-        dot = QWidget()
-        dot.setObjectName("editDialogDot")
-        dot.setFixedSize(6, 6)
-
-        title_lbl = QLabel("Create New...")
-        title_lbl.setObjectName("editDialogTitle")
-
-        close_btn = QToolButton()
-        close_btn.setText("✕")
-        close_btn.setObjectName("dbDialogClose")
-        close_btn.setFixedSize(18, 18)
-        close_btn.clicked.connect(self.reject)
-
-        h_lay.addWidget(dot)
-        h_lay.addWidget(title_lbl)
-        h_lay.addStretch()
-        h_lay.addWidget(close_btn)
-        lay.addWidget(header)
-
-        sep = QFrame()
-        sep.setObjectName("dbDialogSep")
-        sep.setFrameShape(QFrame.Shape.HLine)
-        lay.addWidget(sep)
-
-        # ── Body: three fields ────────────────────────────────────────────
-        body = QWidget()
-        b_lay = QVBoxLayout(body)
-        b_lay.setContentsMargins(14, 10, 14, 8)
-        b_lay.setSpacing(8)
-
-        self._name_edit = QLineEdit()
-        self._name_edit.setObjectName("scriptArgsEdit")
-        self._name_edit.setPlaceholderText("Name  (required)")
-        self._name_edit.setFixedHeight(24)
-        b_lay.addWidget(self._name_edit)
-
-        self._value_edit = QLineEdit()
-        self._value_edit.setObjectName("scriptArgsEdit")
-        self._value_edit.setPlaceholderText("Value  (required)")
-        self._value_edit.setFixedHeight(24)
-        b_lay.addWidget(self._value_edit)
-
-        self._cat_edit = QLineEdit()
-        self._cat_edit.setObjectName("scriptArgsEdit")
-        self._cat_edit.setPlaceholderText("Category  (optional, e.g. Pet/Dog)")
-        self._cat_edit.setFixedHeight(24)
-        b_lay.addWidget(self._cat_edit)
-
-        b_lay.addStretch()
-        lay.addWidget(body, 1)
-
-        sep2 = QFrame()
-        sep2.setObjectName("dbDialogSep")
-        sep2.setFrameShape(QFrame.Shape.HLine)
-        lay.addWidget(sep2)
-
-        # ── Footer ────────────────────────────────────────────────────────
-        footer = QWidget()
-        footer.setObjectName("editDialogFooter")
-        f_lay = QHBoxLayout(footer)
-        f_lay.setContentsMargins(10, 5, 10, 6)
-        f_lay.setSpacing(0)
-
-        save_btn = QPushButton("Save")
-        save_btn.setObjectName("editSaveBtn")
-
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.setObjectName("editCancelBtn")
-
-        f_lay.addWidget(save_btn)
-        f_lay.addStretch()
-        f_lay.addWidget(cancel_btn)
-        lay.addWidget(footer)
-
-        save_btn.clicked.connect(self._accept)
-        cancel_btn.clicked.connect(self.reject)
-        self._name_edit.returnPressed.connect(self._accept)
-        self._value_edit.returnPressed.connect(self._accept)
-        self._cat_edit.returnPressed.connect(self._accept)
-
-        self._restore_pos()
-        QTimer.singleShot(0, self._name_edit.setFocus)
-
-    def _accept(self) -> None:
-        name = self._name_edit.text().strip()
-        value = self._value_edit.text().strip()
-        if not name or not value:
-            QMessageBox.warning(self, APP_NAME, "Name and Value are required.")
-            return
-        category = self._cat_edit.text().strip()
-        _add_note_entry(name, value, category)
-        self.accept()
-
-
-# ── Note Window ────────────────────────────────────────────────────────────────
-
-
-class NoteWindow(QDialog):
-    """Floating, non-modal notes window with its own search + canvas."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Notes")
-        self.setModal(False)
-        self.setMinimumSize(480, 360)
-        self.resize(720, 540)
-        self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
-        # Make the dialog background match the main app window exactly
-        self.setObjectName("noteWindowRoot")
-
-        # Restore session-only position (resets to centre each app start).
-        # Actual centering happens in showEvent once geometry is finalised.
-        pos = _SESSION_POS.get("note_window_pos")
-        if pos and len(pos) == 2:
-            self.move(pos[0], pos[1])
-
-        self._search_timer = QTimer(self)
-        self._search_timer.setSingleShot(True)
-        self._search_timer.setInterval(600)
-        self._search_timer.timeout.connect(self._do_search)
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(10, 8, 10, 8)
-        lay.setSpacing(4)
-
-        # ── Top row: "+" button + search bar ─────────────────────────────
-        top_row = QHBoxLayout()
-        top_row.setSpacing(6)
-
-        self._add_btn = QToolButton()
-        self._add_btn.setText("+")
-        self._add_btn.setObjectName("noteAddBtn")
-        self._add_btn.setFixedSize(26, 26)
-        # Force the text to center properly
-        self._add_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-        self._add_btn.clicked.connect(self._open_create_dialog)
-
-        self._search = QLineEdit()
-        self._search.setPlaceholderText("Search notes by name...")
-        self._search.setFixedHeight(26)
-        self._search.textChanged.connect(self._on_search_changed)
-
-        top_row.addWidget(self._add_btn)
-        top_row.addWidget(self._search, 1)
-        lay.addLayout(top_row)
-
-        # ── Canvas ────────────────────────────────────────────────────────
-        self._panel = NotePanel(NOTES_FILE)
-        self._panel.setMinimumHeight(280)
-        lay.addWidget(self._panel, 1)
-
-    def closeEvent(self, event) -> None:
-        _SESSION_POS["note_window_pos"] = [self.x(), self.y()]
-        super().closeEvent(event)
-
-    def showEvent(self, event) -> None:
-        super().showEvent(event)
-        # Centre over the parent on the very first show of each session.
-        # If the user moved the window this session, _SESSION_POS will have been
-        # set in closeEvent and the __init__ move() placed it correctly already.
-        if "note_window_pos" not in _SESSION_POS:
-            parent = self.parent()
-            if parent is not None:
-                center = parent.window().frameGeometry().center()
-            else:
-                center = QApplication.primaryScreen().availableGeometry().center()
-            fg = self.frameGeometry()
-            fg.moveCenter(center)
-            self.move(fg.topLeft())
-
-    def show_and_reload(self) -> None:
-        """Show (or raise) the window and reload note data."""
-        self._panel.reload(self._search.text().strip())
-        if not self.isVisible():
-            self.show()
-        self.raise_()
-        self.activateWindow()
-
-    def _open_create_dialog(self) -> None:
-        dlg = CreateNoteDialog(self)
-        if dlg.exec():
-            self._panel.reload(self._search.text().strip())
-
-    def _on_search_changed(self) -> None:
-        self._search_timer.start()
-
-    def _do_search(self) -> None:
-        self._search_timer.stop()
-        self._panel.reload(self._search.text().strip())
 
 
 # ── Styling ────────────────────────────────────────────────────────────────────
@@ -4396,8 +4104,8 @@ def apply_style(app: QApplication) -> None:
         #menuBtn:hover   {{ background: {ACCENT_DIM}; color: {ACCENT}; }}
         #menuBtn:pressed {{ background: rgba(255,255,255,0.03); }}
 
-        /* ── notes button ────────────────────────────────────────────── */
-        #noteBtn {{
+        /* ── modules button ─────────────────────────────────────────── */
+        #moduleBtn {{
             background: {BG_SURFACE};
             border: 1px solid {BG_BORDER};
             border-radius: 6px;
@@ -4405,51 +4113,8 @@ def apply_style(app: QApplication) -> None:
             font-size: 14px;
             font-weight: 400;
         }}
-        #noteBtn:hover   {{ background: {BG_RAISED}; border-color: rgba(255,255,255,0.13); color: rgba(210,215,240,0.80); }}
-        #noteBtn:pressed {{ background: rgba(255,255,255,0.03); }}
-
-        /* ── note window "+" button ──────────────────────────────────── */
-        #noteAddBtn {{
-            background: rgba(80,180,120,0.18);
-            border: 1px solid rgba(80,180,120,0.35);
-            border-radius: 4px;
-            color: rgba(100,210,140,0.90);
-            font-size: 14px;
-            font-weight: 700;
-            padding: 0px;
-            text-align: center;
-        }}
-        #noteAddBtn:hover   {{ background: rgba(80,180,120,0.30); border-color: rgba(80,180,120,0.60); color: rgb(120,230,160); }}
-        #noteAddBtn:pressed {{ background: rgba(80,180,120,0.10); }}
-
-        /* ── note window background (match main app window) ─────────── */
-        #noteWindowRoot {{
-            background: {BG_BASE};
-        }}
-        #noteWindowRoot QScrollArea {{
-            background: {BG_BASE};
-        }}
-        #noteWindowRoot QWidget {{
-            background: {BG_BASE};
-        }}
-
-        /* ── note entry card ─────────────────────────────────────────── */
-        #noteEntry {{
-            background: {BG_SURFACE};
-            border: 1px solid {BG_BORDER};
-            border-radius: 7px;
-        }}
-        #noteEntryName {{
-            font-size: 11px;
-            font-weight: 700;
-            color: {TEXT_PRI};
-            background: transparent;
-        }}
-        #noteEntryValue {{
-            font-size: 9px;
-            color: {TEXT_SEC};
-            background: transparent;
-        }}
+        #moduleBtn:hover   {{ background: {BG_RAISED}; border-color: rgba(255,255,255,0.13); color: rgba(210,215,240,0.80); }}
+        #moduleBtn:pressed {{ background: rgba(255,255,255,0.03); }}
 
         /* ── search ──────────────────────────────────────────────────── */
         QLineEdit {{
