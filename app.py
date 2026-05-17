@@ -2008,6 +2008,7 @@ class ResultsPanel(QScrollArea):
 
         self._db: Optional[Database] = None
         self._root_folder: Optional[Path] = None
+        self._az_sort: bool = True
 
         # Loading overlay (child of the viewport so it covers the scroll area)
         self._overlay = LoadingOverlay(self.viewport())
@@ -2144,25 +2145,25 @@ class ResultsPanel(QScrollArea):
             if item is not None and (w := item.widget()):
                 w.deleteLater()
 
-        all_folders: list[str] = []
-        seen: set[str] = set()
+        # Collect all unique folder keys (including implicit ancestor folders)
+        all_folders_set: set[str] = set()
         for asset in assets:
             fk = (asset.get("folder", "") or "").replace("\\", "/")
-            if fk not in seen:
-                seen.add(fk)
-                all_folders.append(fk)
+            all_folders_set.add(fk)
             parts = fk.split("/")
             for depth in range(1, len(parts)):
-                ancestor = "/".join(parts[:depth])
-                if ancestor not in seen:
-                    seen.add(ancestor)
-                    idx = all_folders.index(fk)
-                    all_folders.insert(idx, ancestor)
+                all_folders_set.add("/".join(parts[:depth]))
 
-        all_folders.sort()
+        # Sort all folders; this controls display order within each level
+        all_folders = sorted(all_folders_set, reverse=not self._az_sort)
+
+        # Build sections depth-first (parents before children) so that
+        # add_child_section always finds its parent already in `sections`,
+        # regardless of whether the display order is A-Z or Z-A.
+        all_folders_by_depth = sorted(all_folders_set, key=lambda f: (len(f.split("/")), f))
 
         sections: dict[str, FolderSection] = {}
-        for fk in all_folders:
+        for fk in all_folders_by_depth:
             parts = fk.split("/") if fk else []
             depth = len(parts)
             title = parts[-1] if parts else "(root)"
@@ -2181,6 +2182,11 @@ class ResultsPanel(QScrollArea):
             sec.card_view_requested.connect(self.card_view_requested)
             sections[fk] = sec
 
+        # Now add sections to the layout in sorted display order
+        for fk in all_folders:
+            parts = fk.split("/") if fk else []
+            depth = len(parts)
+            sec = sections[fk]
             if depth <= 1:
                 self._layout.addWidget(sec)
             else:
@@ -3192,6 +3198,13 @@ class MainWindow(QMainWindow):
         sb_lay.addWidget(dot)
         sb_lay.addWidget(self._status_lbl)
         sb_lay.addStretch()
+
+        self._sort_btn = QPushButton("A-Z")
+        self._sort_btn.setObjectName("sortBtn")
+        self._sort_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._sort_btn.clicked.connect(self._toggle_sort)
+        sb_lay.addWidget(self._sort_btn)
+
         outer.addWidget(status_bar)
 
         # ── Results canvas ────────────────────────────────────────────────
@@ -3416,6 +3429,11 @@ class MainWindow(QMainWindow):
 
     def _set_status(self, msg: str) -> None:
         self._status_lbl.setText(msg)
+
+    def _toggle_sort(self) -> None:
+        self._results._az_sort = not self._results._az_sort
+        self._sort_btn.setText("A-Z" if self._results._az_sort else "Z-A")
+        self._do_search()
 
     # ── App menu ──────────────────────────────────────────────────────────
 
@@ -4428,6 +4446,23 @@ def apply_style(app: QApplication) -> None:
         #statusLbl {{ color: {TEXT_SEC}; font-size: 11px; }}
         #statusDot {{ color: {TEXT_DIM}; font-size: 11px; }}
         #dbLbl     {{ color: {ACCENT}; font-size: 11px; font-weight: 600; letter-spacing: 0.3px; }}
+        #sortBtn {{
+            background: transparent;
+            border: 1px solid {BG_BORDER};
+            border-radius: 3px;
+            color: {TEXT_SEC};
+            font-size: 9px;
+            padding: 1px 5px;
+            min-width: 0;
+        }}
+        #sortBtn:hover {{
+            color: {TEXT_PRI};
+            background: rgba(255,255,255,0.06);
+            border-color: rgba(255,255,255,0.18);
+        }}
+        #sortBtn:pressed {{
+            background: rgba(255,255,255,0.03);
+        }}
 
         /* ── hamburger ───────────────────────────────────────────────── */
         #menuBtn {{
