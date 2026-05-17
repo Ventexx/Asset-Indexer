@@ -14,7 +14,7 @@ from typing import Optional
 # os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 from PySide6.QtCore import QEvent, QMimeData, QPoint, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QCursor, QDrag, QIcon, QPainter, QPalette, QPixmap
+from PySide6.QtGui import QAction, QColor, QCursor, QDrag, QIcon, QPainter, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -3137,6 +3137,21 @@ class MainWindow(QMainWindow):
         self._search.textChanged.connect(self._on_search_text_changed)
         self._search.returnPressed.connect(self._on_search_return_pressed)
 
+        # Suppress the default right-click context menu on the search bar
+        self._search.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+
+        # Clear button – real QToolButton overlaid inside the search field
+        self._search_clear_btn = QToolButton(self._search)
+        self._search_clear_btn.setText("Clear")
+        self._search_clear_btn.setObjectName("searchClearBtn")
+        self._search_clear_btn.setCursor(Qt.CursorShape.ArrowCursor)
+        self._search_clear_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._search_clear_btn.hide()
+        self._search_clear_btn.clicked.connect(self._search.clear)
+        # Right-pad the text so it doesn't run under the button
+        self._search.setTextMargins(0, 0, 36, 0)
+        self._search.installEventFilter(self)
+
         # Debounce timer: fires _do_search 1 s after the user stops typing
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
@@ -3339,8 +3354,22 @@ class MainWindow(QMainWindow):
             self._note_window = NoteWindow(self)
         self._note_window.show_and_reload()
 
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self._search and event.type() == QEvent.Type.Resize:
+            btn = self._search_clear_btn
+            btn.adjustSize()
+            btn.move(self._search.width() - btn.width() - 2, (self._search.height() - btn.height()) // 2)
+        return super().eventFilter(obj, event)
+
     def _on_search_text_changed(self) -> None:
         text = self._search.text().strip()
+
+        # Show/hide the inline clear button
+        self._search_clear_btn.setVisible(bool(text))
+        if bool(text):
+            self._search_clear_btn.adjustSize()
+            btn = self._search_clear_btn
+            btn.move(self._search.width() - btn.width() - 2, (self._search.height() - btn.height()) // 2)
 
         # Snapshot expanded folders + scroll position the moment the user starts a new search
         if text and self._pre_search_expanded is None:
@@ -4473,6 +4502,23 @@ def apply_style(app: QApplication) -> None:
             selection-background-color: {ACCENT};
         }}
         QLineEdit:focus {{ border: 1px solid {ACCENT_MID}; background: {BG_RAISED}; }}
+        #searchClearBtn {{
+            background: transparent;
+            border: 1px solid transparent;
+            border-radius: 3px;
+            color: rgba(180,190,220,0.65);
+            font-size: 9px;
+            padding: 1px 4px;
+        }}
+        #searchClearBtn:hover {{
+            color: rgba(210,215,240,0.95);
+            background: rgba(255,255,255,0.08);
+            border-color: rgba(255,255,255,0.15);
+        }}
+        #searchClearBtn:pressed {{
+            color: rgba(255,255,255,0.50);
+            background: rgba(255,255,255,0.03);
+        }}
 
         /* ── folder section header ───────────────────────────────────── */
         #sectionHeaderWrap {{ background: transparent; }}
