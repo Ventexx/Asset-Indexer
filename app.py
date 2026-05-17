@@ -3135,6 +3135,7 @@ class MainWindow(QMainWindow):
         self._search.setPlaceholderText("Press / to search...")
         self._search.setFixedHeight(26)
         self._search.textChanged.connect(self._on_search_text_changed)
+        self._search.returnPressed.connect(self._on_search_return_pressed)
 
         # Debounce timer: fires _do_search 1 s after the user stops typing
         self._search_timer = QTimer(self)
@@ -3346,7 +3347,19 @@ class MainWindow(QMainWindow):
             self._pre_search_expanded = self._results._get_expanded_keys()
             self._pre_search_scroll = self._results.verticalScrollBar().value()
 
+        # If the field just became empty, restore immediately without waiting
+        if not text:
+            self._search_timer.stop()
+            self._do_search()
+            return
+
         self._search_timer.start()  # restart the 1-second debounce window
+
+    def _on_search_return_pressed(self) -> None:
+        """User pressed Enter – skip the debounce wait and search immediately."""
+        if self._search.text().strip():
+            self._search_timer.stop()
+            self._do_search()
 
     def _do_search(self) -> None:
         self._search_timer.stop()
