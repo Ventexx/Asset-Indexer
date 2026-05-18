@@ -1853,6 +1853,7 @@ class FolderSection(QWidget):
         add_tag_act = menu.addAction("Add Tag")
         menu.addSeparator()
         edit_json_act = menu.addAction("Edit JSON...")
+        explorer_act = menu.addAction("Explorer")
 
         chosen = menu.exec(global_pos)
         if chosen is None:
@@ -1861,6 +1862,8 @@ class FolderSection(QWidget):
             self._add_folder_tag()
         elif chosen is edit_json_act:
             self._edit_folder_json()
+        elif chosen is explorer_act:
+            self._open_in_explorer()
 
     def _get_folder_dir(self) -> Optional[Path]:
         """Return the actual filesystem directory for this folder section."""
@@ -1984,6 +1987,22 @@ class FolderSection(QWidget):
                 except Exception:
                     pass
             self.folder_tagged.emit(self._folder_key)
+
+    def _open_in_explorer(self) -> None:
+        """Open the folder's location in the OS file explorer."""
+        folder_dir = self._get_folder_dir()
+        if folder_dir is None or not folder_dir.exists():
+            QMessageBox.warning(self, APP_NAME, "Could not locate folder on disk.")
+            return
+        try:
+            if sys.platform == "win32":
+                subprocess.Popen(["explorer", str(folder_dir)])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(folder_dir)])
+            else:
+                subprocess.Popen(["xdg-open", str(folder_dir)])
+        except Exception as exc:
+            QMessageBox.critical(self, APP_NAME, f"Could not open Explorer:\n{exc}")
 
 
 # ── Results Panel ──────────────────────────────────────────────────────────────
